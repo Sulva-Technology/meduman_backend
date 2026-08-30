@@ -1,0 +1,196 @@
+# Render blueprint for Meduman backend.
+# One web service (API), one background worker, one cron, one Redis instance.
+#
+# Every service boots through the same fail-fast zod schema in
+# `src/config/env.validation.ts`, so they all need the same required variables —
+# a variable present on the API but missing on the worker crashes the worker on
+# start. That drift is what the shared env-var group below prevents: set a value
+# once, all three services get it.
+#
+# Secrets marked `sync: false` are set in the Render dashboard, never in git.
+
+envVarGroups:
+  - name: meduman-shared
+    envVars:
+      - key: APP_URL
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: LOG_LEVEL
+        value: info
+      # --- database: pooled for runtime, direct for migrations. Don't swap. ---
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      # --- Supabase ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_JWT_STRATEGY
+        value: jwks
+      - key: SUPABASE_JWKS_URL
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: SUPABASE_JWT_ISSUER
+        sync: false
+      - key: SUPABASE_JWT_AUDIENCE
+        value: authenticated
+      - key: SUPABASE_STORAGE_BUCKET
+        value: evidence
+      - key: SUPABASE_SIGNED_URL_TTL
+        value: 300
+      # --- Paystack. Transfers OTP must stay DISABLED on this account, or
+      #     automated release stalls waiting for an out-of-band code (D-0). ---
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+      - key: PAYSTACK_BASE_URL
+        value: https://api.paystack.co
+      # Split settlement is never used (D-2) — kept at 0 so a stray subaccount
+      # cannot quietly divert a share of a collection.
+      - key: PAYSTACK_SUBACCOUNT_PERCENTAGE_CHARGE
+        value: 0
+      # --- business config ---
+      - key: QUEUE_PREFIX
+        value: meduman
+      - key: AUTO_RELEASE_WINDOW_HOURS
+        value: 72
+      - key: OTP_LENGTH
+        value: 6
+      - key: OTP_TTL_SECONDS
+        value: 600
+      - key: OTP_HASH_SECRET
+        sync: false
+      - key: OTP_MAX_ATTEMPTS
+        value: 5
+      - key: WEBHOOK_MAX_AGE_SECONDS
+        value: 86400
+      # --- observability (absent DSN = Sentry disabled) ---
+      - key: SENTRY_DSN
+        sync: false
+      # --- chat-native bot gateway ---
+      # An adapter registers only when its credentials are present, so leaving a
+      # platform's vars unset simply disables that platform. The dialog runs in
+      # the worker, so these must be on the shared group (API + worker both need
+      # them). Telegram is the zero-approval path; Meta needs Business
+      # verification; X is a stub gated by X_ADAPTER_ENABLED.
+      - key: CHAT_IDENTITY_EMAIL_DOMAIN
+        value: chat.meduman.local
+      - key: CHAT_SESSION_TTL_SECONDS
+        value: 3600
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_GRAPH_VERSION
+        value: v21.0
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: MESSENGER_PAGE_ACCESS_TOKEN
+        sync: false
+      - key: MESSENGER_PAGE_ID
+        sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: INSTAGRAM_ACCOUNT_ID
+        sync: false
+      - key: X_ADAPTER_ENABLED
+        value: false
+
+services:
+  # ---------------------------------------------------------------------------
+  # API web service
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: meduman-api
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: npm ci && npm run prisma:generate && npm run build
+    # Migrations run here, once per deploy, before the new version takes traffic
+    # — never from a startCommand, where three services would race each other.
+    preDeployCommand: npm run prisma:migrate:deploy
+    startCommand: npm run start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVarGroups:
+      - meduman-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: meduman-redis
+          property: connectionString
+
+  # ---------------------------------------------------------------------------
+  # Background worker (BullMQ processors) — no HTTP
+  # ---------------------------------------------------------------------------
+  - type: worker
+    name: meduman-worker
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: npm ci && npm run prisma:generate && npm run build
+    startCommand: npm run worker
+    autoDeploy: true
+    envVarGroups:
+      - meduman-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: meduman-redis
+          property: connectionString
+
+  # ---------------------------------------------------------------------------
+  # Cron service — periodic scans (auto-release, reconciliation)
+  # ---------------------------------------------------------------------------
+  - type: cron
+    name: meduman-cron
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+    schedule: '*/15 * * * *' # every 15 minutes
+    buildCommand: npm ci && npm run prisma:generate && npm run build
+    startCommand: npm run cron
+    envVarGroups:
+      - meduman-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: meduman-redis
+          property: connectionString
+
+  # ---------------------------------------------------------------------------
+  # Redis (BullMQ backing store)
+  # ---------------------------------------------------------------------------
+  - type: keyvalue
+    name: meduman-redis
+    plan: starter
+    region: frankfurt
+    maxmemoryPolicy: noeviction # never evict queued jobs
+    ipAllowList: [] # internal-only (accessible from Render services)

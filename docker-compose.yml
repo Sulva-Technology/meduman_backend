@@ -1,0 +1,43 @@
+# Local dev/test dependencies ONLY — Postgres + Redis.
+# Production runs on Supabase Postgres + Render Key Value; nothing here is
+# deployed. Host ports are deliberately non-default so this never collides with
+# a locally installed Postgres/Redis.
+#
+#   docker compose up -d
+#   npm run db:push:test     # apply migrations to the test DB
+#   npm run test:e2e
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: meduman-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: meduman
+      POSTGRES_PASSWORD: meduman
+      POSTGRES_DB: meduman_test
+    ports:
+      - '55432:5432'
+    volumes:
+      - meduman-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U meduman -d meduman_test']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: meduman-redis
+    restart: unless-stopped
+    # noeviction mirrors render.yaml — queued payout jobs must never be evicted.
+    command: ['redis-server', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '56379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  meduman-pgdata:

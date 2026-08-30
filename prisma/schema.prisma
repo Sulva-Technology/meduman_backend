@@ -1,0 +1,894 @@
+// Meduman — Prisma schema
+// Two-URL Supabase config:
+//   DATABASE_URL -> pooled (pgbouncer) connection for the runtime client
+//   DIRECT_URL   -> direct connection, used only for migrations
+//
+// MONEY RULE (verbatim from CLAUDE.md, rule set):
+//   Every monetary value in this schema is an `Int` in MINOR UNITS (kobo,
+//   1/100 of a Naira). NEVER Float, NEVER Decimal. Floats lose precision and
+//   would corrupt held funds / payouts. A NGN 1,250.00 charge is stored 125000.
+//
+// The server is the sole owner of transaction state. Enums below are the ONLY
+// legal states — never accept a status/amount from a client.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ===========================================================================
+// Enums — the closed set of legal states.
+// ===========================================================================
+
+/// A single user may hold several of these at once (stored as a set/array).
+enum UserRole {
+  BUYER
+  SELLER
+  FREELANCER
+  BUSINESS
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+/// Seller KYC / business verification progress.
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Reputation tier shown as a badge. Server-computed, never client-set.
+enum TrustLevel {
+  NEW
+  VERIFIED
+  TRUSTED
+  HIGHLY_TRUSTED
+}
+
+/// Lifecycle of a protected transaction. Server is the sole owner of this value.
+/// EXACT set required by spec — do not add/remove/reorder without a migration
+/// and a state-machine review.
+enum TransactionStatus {
+  DRAFT // being built by seller, no active link yet
+  LINK_ACTIVE // payment link live, awaiting a buyer
+  PAYMENT_PENDING // buyer initiated payment, not yet verified
+  PAYMENT_PROTECTED // funds collected & verified — held, not with seller
+  DELIVERY_IN_PROGRESS // seller delivering
+  CONFIRMATION_PENDING // delivered, awaiting buyer confirmation (OTP/in-app)
+  DISPUTED // open dispute — automated release frozen
+  RELEASE_PROCESSING // release job in flight (idempotency guard window)
+  COMPLETED // funds released to seller, transaction closed
+  REFUNDED // funds returned to buyer
+  CANCELLED // terminated before protection/release
+  EXPIRED // link/window lapsed with no payment
+}
+
+/// How a transaction becomes eligible for automated release.
+enum ReleaseRule {
+  BUYER_CONFIRMATION // buyer must confirm (OTP or in-app)
+  AUTO_AFTER_WINDOW // auto-release after a confirmation window elapses (cron)
+  ADMIN_ONLY // only an admin can release (high-value / manual)
+}
+
+/// Who bears the platform fee.
+/// Decision D-3 (2026-08-01): SPLIT was removed. Its charge side never added the
+/// buyer's half, so the platform collected roughly half the fee it booked.
+enum FeeModel {
+  BUYER_PAYS // fee added on top of amount, charged to buyer
+  SELLER_PAYS // fee deducted from seller's settlement
+}
+
+enum PaymentStatus {
+  PENDING // charge initiated, not yet verified
+  SUCCESS // verified via signed webhook or server-side verify
+  FAILED
+  ABANDONED
+}
+
+enum PayoutStatus {
+  PENDING // queued, not yet sent to Paystack
+  PROCESSING // transfer initiated at Paystack
+  SUCCESS // transfer confirmed (signed webhook)
+  FAILED
+  REVERSED
+}
+
+enum DisputeReason {
+  ITEM_NOT_RECEIVED
+  NOT_AS_DESCRIBED
+  DAMAGED
+  SELLER_UNRESPONSIVE
+  WRONG_ITEM
+  FRAUD
+  OTHER
+}
+
+enum DisputeStatus {
+  OPEN // freezes automated release
+  UNDER_REVIEW
+  RESOLVED_RELEASE // resolved in favour of seller -> release allowed
+  RESOLVED_REFUND // resolved in favour of buyer -> refund
+  RESOLVED_PARTIAL // partial refund / partial release
+  CANCELLED
+}
+
+/// Desired outcome the complainant asked for when opening the dispute.
+enum DisputeOutcome {
+  REFUND
+  RELEASE
+  REPLACEMENT
+  PARTIAL_REFUND
+}
+
+/// Anti-malware scan state of an uploaded evidence file.
+enum ScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+  ERROR
+}
+
+enum OtpPurpose {
+  DELIVERY_CONFIRMATION // buyer confirms receipt -> release
+  RELEASE_AUTHORIZATION
+  HIGH_VALUE_STEPUP
+}
+
+/// Lifecycle of a formal invoice. Server owns the PAID state (money rules 1 & 2).
+enum InvoiceStatus {
+  DRAFT // seller building it; no Transaction yet
+  SENT // Transaction + pay link minted, delivered to buyer contact
+  VIEWED // buyer opened the public view
+  PAID // linked Transaction reached PAYMENT_PROTECTED (derived)
+  OVERDUE // dueDate passed, not yet PAID (cron-set)
+  VOID // seller cancelled (pre-PAID only)
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+  IN_APP
+  WHATSAPP
+  TELEGRAM
+  INSTAGRAM
+  MESSENGER
+}
+
+/// Social-chat platforms the bot gateway speaks. TELEGRAM is the first adapter;
+/// WHATSAPP/INSTAGRAM/MESSENGER share one Meta adapter; X needs a paid API tier.
+enum ChatPlatform {
+  TELEGRAM
+  WHATSAPP
+  INSTAGRAM
+  MESSENGER
+  X
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+/// Actor class for audit rows. Actors span three identity spaces (app users,
+/// back-office admins, automated system) so audit actorId is NOT a hard FK.
+enum ActorType {
+  USER
+  ADMIN
+  SYSTEM
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  OPERATIONS
+  DISPUTE_REVIEWER
+  COMPLIANCE
+  FINANCE
+  SUPPORT
+}
+
+enum AdminStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum MerchantStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum WebhookEndpointStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum OutboundEventStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+// ===========================================================================
+// Identity
+// ===========================================================================
+
+/// Mirror of Supabase Auth users. Auth/passwords live in Supabase, not here.
+/// `id` is the Supabase auth.users UUID (not generated here).
+model User {
+  id         String     @id @db.Uuid // == Supabase auth.users.id
+  email      String     @unique
+  phone      String?
+  fullName   String?
+  /// A user may be several roles at once (buyer AND seller AND ...).
+  roleFlags  UserRole[] @default([])
+  status     UserStatus @default(ACTIVE)
+  /// Owning merchant tenant for EaaS API-driven users. Null = first-party
+  /// Meduman user (website/chat), never client-writable.
+  merchantId String?    @db.Uuid
+  merchant   Merchant?  @relation(fields: [merchantId], references: [id])
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  profile              Profile?
+  sellerProfile        SellerProfile?
+  transactionsAsSeller Transaction[]  @relation("SellerTransactions")
+  transactionsAsBuyer  Transaction[]  @relation("BuyerTransactions")
+  payouts              Payout[]
+  notifications        Notification[]
+  chatIdentities       ChatIdentity[]
+  invoicesAsSeller     Invoice[]      @relation("SellerInvoices")
+  invoicesAsBuyer      Invoice[]      @relation("BuyerInvoices")
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([merchantId])
+  @@map("users")
+}
+
+/// General public profile. 1:1 with User.
+model Profile {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @unique @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  country      String?
+  city         String?
+  avatarUrl    String?
+  bio          String?
+  /// Social-commerce channel links (Instagram, WhatsApp, TikTok, ...).
+  channelLinks Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("profiles")
+}
+
+/// Seller-specific profile: business identity + Paystack settlement wiring.
+model SellerProfile {
+  id                     String             @id @default(uuid()) @db.Uuid
+  userId                 String             @unique @db.Uuid
+  user                   User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName           String?
+  category               String?
+  verificationStatus     VerificationStatus @default(UNVERIFIED)
+  trustLevel             TrustLevel         @default(NEW)
+  /// Unique public badge identifier (e.g. shown on a seller storefront URL).
+  badgeSlug              String?            @unique
+  /// DEPRECATED (decision D-2): split settlement is never used — a subaccount at
+  /// collection would pay the seller directly and break the hold. Kept dormant.
+  paystackSubaccountCode String?            @unique
+  /// Paystack transfer recipient code (RCP_...) — the ONLY payout destination.
+  providerRecipientCode  String?            @unique
+  /// Settlement bank code (NUBAN). Non-secret.
+  settlementBankCode     String?
+  /// Last 4 digits of the settlement account. The full number is never stored.
+  settlementAccountLast4 String?
+  /// Account name as resolved by the bank — shown back to the seller.
+  settlementAccountName  String?
+  settlementBankVerified Boolean            @default(false)
+  /// Owning merchant tenant for EaaS API-driven sellers. Null = first-party.
+  /// Scoping column only — no relation (SellerProfile has no direct FK need).
+  merchantId             String?            @db.Uuid
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  @@index([verificationStatus])
+  @@index([trustLevel])
+  @@index([merchantId])
+  @@map("seller_profiles")
+}
+
+/// Pre-launch waitlist / lead capture. Not linked to auth users.
+model WaitlistEntry {
+  id                  String   @id @default(uuid()) @db.Uuid
+  fullName            String
+  email               String   @unique
+  phone               String?
+  userType            String? // free-form marketing segment (buyer/seller/...)
+  channel             String? // where they primarily sell (Instagram, ...)
+  country             String?
+  city                String?
+  useCase             String?
+  /// Self-reported average transaction value — minor units (kobo).
+  avgTransactionValue Int?
+  consent             Boolean  @default(false)
+  createdAt           DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("waitlist_entries")
+}
+
+// ===========================================================================
+// Transactions — THE state machine
+// ===========================================================================
+
+/// The protected transaction. Server-owned state machine.
+model Transaction {
+  id           String  @id @default(uuid()) @db.Uuid
+  /// Unguessable public identifier used in shareable payment links.
+  publicLinkId String  @unique
+  sellerId     String  @db.Uuid
+  seller       User    @relation("SellerTransactions", fields: [sellerId], references: [id])
+  /// Null until a buyer pays — the link is created before the buyer is known.
+  buyerId      String? @db.Uuid
+  buyer        User?   @relation("BuyerTransactions", fields: [buyerId], references: [id])
+
+  title       String
+  description String?
+
+  /// Protected amount — minor units (kobo). Integers only, never a float.
+  amount   Int
+  currency String @default("NGN")
+
+  status               TransactionStatus @default(DRAFT)
+  releaseRule          ReleaseRule       @default(BUYER_CONFIRMATION)
+  expectedDeliveryDate DateTime?
+  expiresAt            DateTime?
+
+  feeModel  FeeModel @default(BUYER_PAYS)
+  /// Platform fee — minor units (kobo).
+  feeAmount Int      @default(0)
+
+  /// Owning merchant tenant for EaaS API-driven transactions. Null =
+  /// first-party (website/chat), never client-writable.
+  merchantId String?   @db.Uuid
+  merchant   Merchant? @relation(fields: [merchantId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items    TransactionItem[]
+  invoice  Invoice?
+  payments Payment[]
+  payouts  Payout[]
+  disputes Dispute[]
+  evidence Evidence[]
+  timeline TimelineEvent[]
+  otpCodes OtpCode[]
+
+  @@index([status])
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([createdAt])
+  @@index([expiresAt])
+  @@index([merchantId])
+  @@map("transactions")
+}
+
+/// Line item of a transaction (a transaction can cover several goods/services).
+model TransactionItem {
+  id             String      @id @default(uuid()) @db.Uuid
+  transactionId  String      @db.Uuid
+  transaction    Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  title          String
+  description    String?
+  quantity       Int         @default(1)
+  deliveryMethod String?
+  deliveryTerms  String?
+  createdAt      DateTime    @default(now())
+
+  @@index([transactionId])
+  @@map("transaction_items")
+}
+
+/// A formal, itemized invoice. Front-end onto exactly one protected Transaction.
+/// Server owns every money field and the PAID state (money rules 1 & 2).
+model Invoice {
+  id       String @id @default(uuid()) @db.Uuid
+  sellerId String @db.Uuid
+  seller   User   @relation("SellerInvoices", fields: [sellerId], references: [id])
+
+  /// Seller-sequential human number, e.g. "INV-0001". Unique per seller.
+  number String
+
+  /// Buyer contact captured at draft time. buyerId is filled once the buyer pays.
+  buyerId    String? @db.Uuid
+  buyer      User?   @relation("BuyerInvoices", fields: [buyerId], references: [id])
+  buyerName  String?
+  buyerEmail String?
+  buyerPhone String?
+
+  status    InvoiceStatus @default(DRAFT)
+  issueDate DateTime      @default(now())
+  dueDate   DateTime?
+
+  currency     String @default("NGN")
+  /// All money = minor units (kobo), server-computed, never client-supplied.
+  subtotal     Int    @default(0)
+  taxRatePctBp Int? // basis points; 750 = 7.5% VAT. null = no tax.
+  taxAmount    Int    @default(0)
+  total        Int    @default(0)
+
+  notes String?
+  terms String?
+
+  /// Null until sent. One Transaction per invoice.
+  transactionId String?      @unique @db.Uuid
+  transaction   Transaction? @relation(fields: [transactionId], references: [id])
+
+  /// Unguessable public identifier for the buyer-facing read-only view.
+  publicViewId String @unique
+
+  sentAt    DateTime?
+  viewedAt  DateTime?
+  paidAt    DateTime?
+  voidedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  lineItems InvoiceLineItem[]
+
+  @@unique([sellerId, number])
+  @@index([sellerId, status])
+  @@index([status, dueDate])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  invoiceId   String   @db.Uuid
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  quantity    Int      @default(1)
+  unitPrice   Int // kobo
+  lineTotal   Int // kobo, server-computed = unitPrice * quantity
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+/// Per-seller atomic invoice-number sequence. `nextSeq` = the next number to allocate.
+model InvoiceCounter {
+  sellerId String @id @db.Uuid
+  nextSeq  Int    @default(1)
+
+  @@map("invoice_counters")
+}
+
+// ===========================================================================
+// Money movement
+// ===========================================================================
+
+/// Inbound payment (Paystack collection). Status changes ONLY from a
+/// signature-verified webhook or a server-side verify call — never a client callback.
+model Payment {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  provider                   String        @default("paystack")
+  /// OUR generated reference. UNIQUE — a duplicate would double-credit. For a
+  /// hosted checkout this equals the Paystack reference; for a dedicated virtual
+  /// account (DVA) Paystack generates its own reference (`providerChargeReference`).
+  providerReference          String        @unique
+  /// Paystack's own charge reference, learned from `charge.success`. Only a DVA
+  /// payment needs it (hosted reuses `providerReference`). UNIQUE + nullable so
+  /// binding it is a one-shot idempotency lock (money rule 4).
+  providerChargeReference    String?       @unique
+  /// Paystack customer created for a DVA collection — one throwaway customer per
+  /// transaction, so an inbound transfer maps deterministically to one payment.
+  providerCustomerCode       String?
+  /// Assigned dedicated virtual account, once Paystack fires
+  /// `dedicatedaccount.assign.success`. Displayed to the buyer in chat.
+  providerDedicatedAccountId String?
+  virtualAccountNumber       String?
+  virtualAccountBank         String?
+  /// Collected amount — minor units (kobo).
+  amount                     Int
+  currency                   String        @default("NGN")
+  status                     PaymentStatus @default(PENDING)
+  verifiedAt                 DateTime?
+  /// Last verified provider payload (audit / dispute evidence).
+  rawPayload                 Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([transactionId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+/// Outbound payout to a seller. MUST be idempotent — see idempotencyKey (rule 4).
+model Payout {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  sellerId      String      @db.Uuid
+  seller        User        @relation(fields: [sellerId], references: [id])
+
+  /// Idempotency guard — a duplicate webhook / retried job MUST reuse this key
+  /// and never create a second payout. UNIQUE is the financial safety net.
+  idempotencyKey            String       @unique
+  /// Paystack transfer_code. UNIQUE — one provider transfer maps to one payout.
+  providerTransferCode      String?      @unique
+  /// Reference sent to Paystack for the current attempt. Equals `idempotencyKey`
+  /// on the first attempt; an operator retry after a failed transfer sends a new
+  /// one (Paystack rejects a reused reference) without creating a second payout.
+  providerTransferReference String?      @unique
+  /// Released amount — minor units (kobo).
+  amount                    Int
+  currency                  String       @default("NGN")
+  status                    PayoutStatus @default(PENDING)
+  attemptCount              Int          @default(0)
+  lastError                 String?
+
+  /// Owning merchant tenant for EaaS API-driven payouts. Null = first-party,
+  /// never client-writable.
+  merchantId String?   @db.Uuid
+  merchant   Merchant? @relation(fields: [merchantId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([transactionId])
+  @@index([sellerId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([merchantId])
+  @@map("payouts")
+}
+
+// ===========================================================================
+// Dispute + evidence
+// ===========================================================================
+
+/// A dispute freezes automated release for its transaction while OPEN/UNDER_REVIEW.
+model Dispute {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  /// User id (buyer or seller) who opened it. Not FK'd — see actor note.
+  openedBy         String          @db.Uuid
+  reason           DisputeReason
+  description      String?
+  desiredOutcome   DisputeOutcome?
+  status           DisputeStatus   @default(OPEN)
+  resolution       String?
+  responseDeadline DateTime?
+  resolvedAt       DateTime?
+  /// Admin id that resolved it (AdminUser). Not FK'd — see actor note.
+  resolvedBy       String?         @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  evidence Evidence[]
+
+  @@index([transactionId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("disputes")
+}
+
+/// Proof/evidence file. Stored in Supabase Storage (private); served via
+/// backend-generated signed URLs only. We store the path, never public URLs.
+/// Always bound to a transaction; optionally also to a specific dispute.
+model Evidence {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  disputeId     String?     @db.Uuid
+  dispute       Dispute?    @relation(fields: [disputeId], references: [id], onDelete: SetNull)
+
+  /// Uploader user id. Not FK'd — see actor note.
+  uploadedBy  String     @db.Uuid
+  storagePath String // path within the private Supabase Storage bucket
+  mimeType    String
+  sizeBytes   Int
+  scanStatus  ScanStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+
+  @@index([transactionId])
+  @@index([disputeId])
+  @@index([scanStatus])
+  @@map("evidence")
+}
+
+// ===========================================================================
+// OTP
+// ===========================================================================
+
+/// One-time code for buyer confirmation / release step-up.
+/// Only the HASH is stored — never the plaintext code.
+model OtpCode {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  codeHash     String // HMAC/bcrypt hash of the OTP — never plaintext
+  purpose      OtpPurpose
+  expiresAt    DateTime
+  attemptCount Int        @default(0)
+  consumedAt   DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@index([transactionId])
+  @@index([expiresAt])
+  @@map("otp_codes")
+}
+
+// ===========================================================================
+// Timeline / audit / notifications
+// ===========================================================================
+
+/// Per-transaction, user-facing timeline (what the buyer/seller see happened).
+/// Distinct from AuditLog, which is the immutable system-wide record.
+model TimelineEvent {
+  id            String      @id @default(uuid()) @db.Uuid
+  transactionId String      @db.Uuid
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  /// Actor id (user/admin/system). Not FK'd — actors span identity spaces.
+  actorId   String?  @db.Uuid
+  actorRole String? // e.g. BUYER / SELLER / ADMIN / SYSTEM
+  type      String // e.g. "payment.protected", "delivery.marked"
+  oldState  String?
+  newState  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([transactionId])
+  @@index([createdAt])
+  @@map("timeline_events")
+}
+
+/// Immutable, append-only audit log. One row per state transition / admin
+/// action (rule 6). NEVER updated or deleted. Actor is polymorphic, so no FK.
+model AuditLog {
+  id         String    @id @default(uuid()) @db.Uuid
+  actorId    String?   @db.Uuid // null = system/cron/webhook
+  actorType  ActorType @default(SYSTEM)
+  action     String // e.g. "transaction.status_change", "payout.release"
+  targetType String // e.g. "Transaction", "Payout", "Dispute"
+  targetId   String? // id of the affected row
+  reason     String?
+  metadata   Json?
+  createdAt  DateTime  @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+/// Outbound notification (email/SMS/push/...). Delivery is a background job.
+model Notification {
+  id          String              @id @default(uuid()) @db.Uuid
+  userId      String              @db.Uuid
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel     NotificationChannel
+  templateKey String
+  payload     Json?
+  status      NotificationStatus  @default(PENDING)
+  sentAt      DateTime?
+  /// When the recipient marked it read in-app (null = unread). Distinct from
+  /// delivery `status`, which tracks the outbound send.
+  readAt      DateTime?
+  createdAt   DateTime            @default(now())
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// ===========================================================================
+// Webhook idempotency
+// ===========================================================================
+
+/// Record of every processed provider webhook. providerEventId is UNIQUE so a
+/// re-delivered webhook is detected and never processed twice (idempotency).
+model WebhookEvent {
+  id               String    @id @default(uuid()) @db.Uuid
+  provider         String    @default("paystack")
+  /// Provider's event id. UNIQUE — the idempotency key for inbound webhooks.
+  providerEventId  String    @unique
+  eventType        String
+  rawPayload       Json
+  processedAt      DateTime?
+  processingResult String? // "ok" / error summary
+  createdAt        DateTime  @default(now())
+
+  @@index([eventType])
+  @@index([processedAt])
+  @@map("webhook_events")
+}
+
+// ===========================================================================
+// Chat-native bot gateway
+// ===========================================================================
+
+/// Maps a social-platform chat account to a Meduman User. The user is minted in
+/// Supabase Auth on first contact, so `userId` is a real auth uuid and a
+/// chat-born user can later sign into the website with the same identity.
+model ChatIdentity {
+  id             String       @id @default(uuid()) @db.Uuid
+  platform       ChatPlatform
+  /// The platform's own user id (Telegram chat id, Meta PSID, ...).
+  platformUserId String
+  userId         String       @db.Uuid
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayName    String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  session ChatSession?
+
+  /// One Meduman identity per platform account — the uniqueness that makes first
+  /// contact idempotent (never a second auth user for the same chat account).
+  @@unique([platform, platformUserId])
+  @@index([userId])
+  @@map("chat_identities")
+}
+
+/// Conversational state for one chat identity. This is NOT transaction state —
+/// the state machine remains the sole owner of TransactionStatus. Losing a
+/// session only loses the user's place in a dialog.
+model ChatSession {
+  id             String       @id @default(uuid()) @db.Uuid
+  chatIdentityId String       @unique @db.Uuid
+  chatIdentity   ChatIdentity @relation(fields: [chatIdentityId], references: [id], onDelete: Cascade)
+  /// Current dialog step (a ChatStep string). Free-form so steps can evolve
+  /// without a migration.
+  step           String       @default("IDLE")
+  /// Partial input gathered across steps (draft tx fields, pending tx id, ...).
+  draft          Json?
+  /// The transaction the dialog is currently acting on, if any.
+  transactionId  String?      @db.Uuid
+  expiresAt      DateTime
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([expiresAt])
+  @@map("chat_sessions")
+}
+
+/// Every inbound chat message, recorded for idempotency. The unique
+/// (platform, providerMessageId) guarantees a re-delivered webhook is processed
+/// at most once — the same backstop WebhookEvent gives Paystack.
+model ChatInboundEvent {
+  id                String       @id @default(uuid()) @db.Uuid
+  platform          ChatPlatform
+  providerMessageId String
+  rawPayload        Json
+  processedAt       DateTime?
+  processingResult  String?
+  createdAt         DateTime     @default(now())
+
+  @@unique([platform, providerMessageId])
+  @@index([processedAt])
+  @@map("chat_inbound_events")
+}
+
+// ===========================================================================
+// Back-office admins (separate identity space from app Users)
+// ===========================================================================
+
+/// Back-office operator. Separate from Supabase-auth app Users.
+model AdminUser {
+  id        String      @id @default(uuid()) @db.Uuid
+  email     String      @unique
+  fullName  String?
+  role      AdminRole
+  status    AdminStatus @default(ACTIVE)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@index([role])
+  @@map("admin_users")
+}
+
+// ===========================================================================
+// EaaS — merchant tenancy (third-party developers driving escrow via /v1)
+// ===========================================================================
+
+/// A third-party developer tenant integrating our escrow via the /v1 API.
+model Merchant {
+  id              String         @id @default(uuid()) @db.Uuid
+  name            String
+  status          MerchantStatus @default(ACTIVE)
+  /// Gate: sk_live keys only work once an admin flips this true.
+  livemodeEnabled Boolean        @default(false)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  apiKeys         MerchantApiKey[]
+  users           User[]
+  transactions    Transaction[]
+  payouts         Payout[]
+  webhookEndpoint WebhookEndpoint?
+
+  @@index([status])
+  @@map("merchants")
+}
+
+/// An issued secret API key. Plaintext is shown once at creation, never stored.
+model MerchantApiKey {
+  id         String    @id @default(uuid()) @db.Uuid
+  merchantId String    @db.Uuid
+  merchant   Merchant  @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  /// Public, non-secret label: e.g. "sk_test_9f3a1c" (env tag + short suffix).
+  keyPrefix  String
+  /// Keyed HMAC-SHA256 of the full secret. The lookup key. Never the plaintext.
+  keyHash    String    @unique
+  /// Derived from the key prefix. sk_live => true.
+  livemode   Boolean
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([merchantId])
+  @@map("merchant_api_keys")
+}
+
+/// A merchant's single outbound-webhook destination. Secret is AES-GCM encrypted.
+model WebhookEndpoint {
+  id         String                @id @default(uuid()) @db.Uuid
+  merchantId String                @unique @db.Uuid
+  merchant   Merchant              @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  url        String
+  /// AES-256-GCM ciphertext of the whsec_ secret ("iv:tag:ciphertext" hex). Never returned.
+  secretEnc  String
+  /// https required when true (live key registered it); http permitted when false (test).
+  livemode   Boolean
+  status     WebhookEndpointStatus @default(ACTIVE)
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
+
+  @@map("webhook_endpoints")
+}
+
+/// Transactional outbox row + delivery log for one outbound event.
+model OutboundEvent {
+  id           String              @id @default(uuid()) @db.Uuid
+  merchantId   String              @db.Uuid
+  type         String
+  payload      Json
+  status       OutboundEventStatus @default(PENDING)
+  attemptCount Int                 @default(0)
+  lastError    String?
+  deliveredAt  DateTime?
+  createdAt    DateTime            @default(now())
+
+  @@index([status, createdAt])
+  @@index([merchantId, createdAt])
+  @@map("outbound_events")
+}
