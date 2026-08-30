@@ -69,6 +69,13 @@ envVarGroups:
         sync: false
       - key: OTP_MAX_ATTEMPTS
         value: 5
+      # Shared, persistent EaaS secrets. Render generates values only if absent.
+      # Restore existing production values before syncing if already in use;
+      # replacing them invalidates API keys / encrypted webhook secrets.
+      - key: EAAS_API_KEY_SECRET
+        generateValue: true
+      - key: EAAS_WEBHOOK_SIGNING_KEY
+        generateValue: true
       - key: WEBHOOK_MAX_AGE_SECONDS
         value: 86400
       # --- observability (absent DSN = Sentry disabled) ---
@@ -126,9 +133,8 @@ services:
     startCommand: npm run start
     healthCheckPath: /health
     autoDeploy: true
-    envVarGroups:
-      - meduman-shared
     envVars:
+      - fromGroup: meduman-shared
       - key: NODE_ENV
         value: production
       - key: PORT
@@ -151,9 +157,8 @@ services:
     buildCommand: npm ci && npm run prisma:generate && npm run build
     startCommand: npm run worker
     autoDeploy: true
-    envVarGroups:
-      - meduman-shared
     envVars:
+      - fromGroup: meduman-shared
       - key: NODE_ENV
         value: production
       - key: REDIS_URL
@@ -174,9 +179,8 @@ services:
     schedule: '*/15 * * * *' # every 15 minutes
     buildCommand: npm ci && npm run prisma:generate && npm run build
     startCommand: npm run cron
-    envVarGroups:
-      - meduman-shared
     envVars:
+      - fromGroup: meduman-shared
       - key: NODE_ENV
         value: production
       - key: REDIS_URL

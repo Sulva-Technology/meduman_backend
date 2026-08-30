@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { AppModule } from './app.module';
 import type { Env } from './config/env.validation';
 import { initSentry } from './observability/sentry';
+import { buildCorsOptions } from './config/cors.config';
 
 /**
  * API web service entrypoint (Render web service).
@@ -25,13 +26,13 @@ async function bootstrap(): Promise<void> {
 
   const config: ConfigService<Env, true> = app.get(ConfigService);
   const port = config.get('PORT', { infer: true });
-  const origins = config
-    .get('FRONTEND_ORIGIN', { infer: true })
-    .split(',')
-    .map((o) => o.trim());
-
   app.use(helmet());
-  app.enableCors({ origin: origins, credentials: true });
+  app.enableCors(
+    buildCorsOptions(
+      config.get('FRONTEND_ORIGIN', { infer: true }),
+      config.get('NODE_ENV', { infer: true }),
+    ),
+  );
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
   );
