@@ -40,7 +40,7 @@ export class QueueService {
       RELEASE_JOB,
       { transactionId },
       {
-        jobId: `release:${transactionId}`,
+        jobId: `release.${transactionId}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,
@@ -56,7 +56,7 @@ export class QueueService {
    */
   async enqueueChatInbound(data: ChatInboundJobData): Promise<void> {
     await this.chatQueue.add(CHAT_INBOUND_JOB, data, {
-      jobId: `chat-in:${data.platform}:${data.providerMessageId}`,
+      jobId: `chat-in.${data.platform}:${data.providerMessageId}`,
       attempts: 3,
       backoff: { type: 'exponential', delay: 3000 },
       removeOnComplete: true,
@@ -84,7 +84,7 @@ export class QueueService {
       WEBHOOK_DELIVER_JOB,
       { eventId },
       {
-        jobId: `webhook:${eventId}`,
+        jobId: `webhook.${eventId}`,
         attempts: 5,
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,

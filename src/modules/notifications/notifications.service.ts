@@ -77,7 +77,7 @@ export class NotificationsService {
   /** Enqueue delivery of an issued OTP code. jobId dedupes repeat sends. */
   async enqueueOtpCode(data: OtpNotificationJobData): Promise<void> {
     await this.queue.add(OTP_NOTIFICATION_JOB, data, {
-      jobId: `otp:${data.otpId}`,
+      jobId: `otp.${data.otpId}`,
       attempts: 3,
       backoff: { type: 'exponential', delay: 3000 },
       // Remove on completion so the plaintext code is not retained in Redis; cap
@@ -170,7 +170,7 @@ export class NotificationsService {
   /** Enqueue delivery of a sent invoice. jobId dedupes repeat sends. */
   async enqueueInvoice(data: InvoiceDeliveryJobData): Promise<void> {
     await this.queue.add(INVOICE_DELIVERY_JOB, data, {
-      jobId: `invoice:${data.invoiceId}`,
+      jobId: `invoice.${data.invoiceId}`,
       attempts: 3,
       backoff: { type: 'exponential', delay: 3000 },
       removeOnComplete: true,
