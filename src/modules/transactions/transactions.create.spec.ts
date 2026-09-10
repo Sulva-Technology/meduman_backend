@@ -18,8 +18,33 @@ function makePrisma(existing: Record<string, unknown> | null = null) {
         ),
       findUnique: jest.fn().mockResolvedValue(existing),
     },
+    // createDraft also probes the user mirror for the SELLER flag grant.
+    user: {
+      findUnique: jest.fn().mockResolvedValue(null),
+      update: jest.fn(),
+    },
   };
   return { prisma: prisma as unknown as PrismaService, spy: prisma.transaction };
+}
+
+/** Prisma double with a user mirror, for roleFlag grant tests. */
+function makePrismaWithUser(user: { roleFlags: string[] } | null) {
+  const userUpdate = jest.fn();
+  const prisma = {
+    transaction: {
+      create: jest
+        .fn()
+        .mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+          Promise.resolve({ id: 'tx-1', status: 'DRAFT', ...data }),
+        ),
+      findUnique: jest.fn().mockResolvedValue(null),
+    },
+    user: {
+      findUnique: jest.fn().mockResolvedValue(user),
+      update: userUpdate,
+    },
+  };
+  return { prisma: prisma as unknown as PrismaService, userUpdate };
 }
 
 describe('TransactionsService.createDraft', () => {
@@ -60,6 +85,29 @@ describe('TransactionsService.createDraft', () => {
     expect(data.releaseRule).toBe('AUTO_AFTER_WINDOW');
     expect(data.feeModel).toBe('SELLER_PAYS');
     expect(data.feeAmount).toBe(25000);
+  });
+
+  it('grants the SELLER role flag to a first-time seller (server-owned)', async () => {
+    const { prisma, userUpdate } = makePrismaWithUser({ roleFlags: [] });
+    const service = new TransactionsService(prisma, stubOutbound);
+
+    await service.createDraft({ sellerId: 'seller-1', title: 'Sneakers', amount: 1500000 });
+
+    expect(userUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'seller-1' },
+        data: { roleFlags: ['SELLER'] },
+      }),
+    );
+  });
+
+  it('never duplicates an existing SELLER role flag', async () => {
+    const { prisma, userUpdate } = makePrismaWithUser({ roleFlags: ['SELLER'] });
+    const service = new TransactionsService(prisma, stubOutbound);
+
+    await service.createDraft({ sellerId: 'seller-1', title: 'Sneakers', amount: 1500000 });
+
+    expect(userUpdate).not.toHaveBeenCalled();
   });
 });
 

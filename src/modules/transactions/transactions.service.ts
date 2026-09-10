@@ -11,6 +11,7 @@ import type {
   Transaction,
   TransactionStatus,
   TrustLevel,
+  UserRole,
 } from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
 import { OutboundEventsService } from '@/modules/outbound-events/outbound-events.service';
@@ -149,7 +150,7 @@ export class TransactionsService {
    * only advance through the machine (money rule 1).
    */
   async createDraft(input: CreateDraftInput): Promise<Transaction> {
-    return this.prisma.transaction.create({
+    const tx = await this.prisma.transaction.create({
       data: {
         sellerId: input.sellerId,
         title: input.title,
@@ -165,6 +166,27 @@ export class TransactionsService {
         ...(input.merchantId ? { merchantId: input.merchantId } : {}),
       },
     });
+
+    // Anyone who sells is a seller: grant the flag so dashboards default to the
+    // seller view. Server-owned — read-then-set so a concurrent grant can't
+    // duplicate the flag.
+    await this.grantRoleFlag(input.sellerId, 'SELLER');
+
+    return tx;
+  }
+
+  /** Add a role flag to the user mirror if not already present. */
+  private async grantRoleFlag(userId: string, flag: UserRole): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { roleFlags: true },
+    });
+    if (user && !user.roleFlags.includes(flag)) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { roleFlags: [...user.roleFlags, flag] },
+      });
+    }
   }
 
   /** Load a transaction or throw 404. */

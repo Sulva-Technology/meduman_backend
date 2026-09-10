@@ -339,6 +339,25 @@ export class PaymentsService {
   }
 
   /**
+   * Re-verify one known payment row server-side. Used by cron reconciliation for
+   * a charge whose webhook AND browser-return verify were both missed. Resolves
+   * the verification reference the same way the webhook does (a bound DVA charge
+   * verifies under Paystack's reference, a hosted charge under ours), and is a
+   * no-op for anything no longer PENDING.
+   */
+  async reconcilePayment(paymentId: string): Promise<Payment> {
+    const payment = await this.prisma.payment.findUnique({ where: { id: paymentId } });
+    if (!payment) {
+      throw new NotFoundException(`Payment ${paymentId} not found`);
+    }
+    if (payment.status !== PaymentStatus.PENDING) {
+      return payment;
+    }
+    const reference = payment.providerChargeReference ?? payment.providerReference;
+    return this.verifyAndProtectPayment(payment, reference, 'SERVER_VERIFY');
+  }
+
+  /**
    * The shared verify+protect core. Idempotent (money rule 4): an already-SUCCESS
    * payment is a no-op. Verifies the charge at Paystack under `verifyReference`
    * (our reference for hosted, Paystack's for DVA), refuses to protect on any

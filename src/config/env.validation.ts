@@ -45,6 +45,13 @@ export const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   QUEUE_PREFIX: z.string().default('meduman'),
+  // Run the BullMQ processors inside the API process as well (see main.ts).
+  // Off by default — `worker.ts` stays the production posture; this exists for a
+  // deployment that runs the web service without a separate background worker.
+  RUN_EMBEDDED_WORKER: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 
   // Business config
   AUTO_RELEASE_WINDOW_HOURS: z.coerce.number().int().positive().default(72),
@@ -67,6 +74,12 @@ export const envSchema = z.object({
   // this. Generous by default (24h) — Paystack legitimately retries over hours;
   // the providerEventId unique guard handles exact-duplicate retries. Backstop only.
   WEBHOOK_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(86_400),
+
+  // A PENDING charge older than this is re-verified server-side by the cron, so a
+  // payment that succeeded at Paystack while BOTH the webhook and the buyer's
+  // browser-return verify were missed still protects (never stranded). Generous
+  // enough that a slow checkout is not re-verified mid-flight.
+  PAYMENT_RECONCILE_AFTER_SECONDS: z.coerce.number().int().positive().default(900),
 
   // Observability — Sentry error tracking. Optional: absent = disabled (no-op).
   SENTRY_DSN: z.string().url().optional(),

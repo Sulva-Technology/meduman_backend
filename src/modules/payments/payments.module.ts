@@ -3,6 +3,7 @@ import { TransactionsModule } from '@/modules/transactions/transactions.module';
 import { InvoicesModule } from '@/modules/invoices/invoices.module';
 import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
+import { PaymentReconcileService } from './payment-reconcile.service';
 
 /**
  * Payments: Paystack collection + server-side verify.
@@ -12,7 +13,7 @@ import { PaymentsService } from './payments.service';
 @Module({
   imports: [TransactionsModule, InvoicesModule],
   controllers: [PaymentsController],
-  providers: [PaymentsService],
-  exports: [PaymentsService],
+  providers: [PaymentsService, PaymentReconcileService],
+  exports: [PaymentsService, PaymentReconcileService],
 })
 export class PaymentsModule {}

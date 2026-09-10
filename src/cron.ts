@@ -4,6 +4,7 @@ import { AppModule } from './app.module';
 import { AutoReleaseService } from './modules/transactions/auto-release.service';
 import { InvoicesService } from './modules/invoices/invoices.service';
 import { OutboundEventRelay } from './modules/merchants/outbound-event-relay.service';
+import { PaymentReconcileService } from './modules/payments/payment-reconcile.service';
 import { initSentry } from './observability/sentry';
 
 /**
@@ -18,6 +19,12 @@ async function bootstrapCron(): Promise<void> {
   app.useLogger(app.get(PinoLogger));
   const logger = app.get(PinoLogger);
   try {
+    logger.log('Reconciling stranded pending payments');
+    const reconciled = await app.get(PaymentReconcileService).reconcilePending();
+    logger.log(
+      `Payment reconcile complete — ${reconciled.protected}/${reconciled.checked} payment(s) protected`,
+    );
+
     logger.log('Cron tick started — scanning for auto-release');
     const { released } = await app.get(AutoReleaseService).scanAndRelease();
     logger.log(`Auto-release scan complete — ${released} release job(s) enqueued`);

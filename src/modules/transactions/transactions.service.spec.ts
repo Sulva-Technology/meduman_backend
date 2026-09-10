@@ -152,7 +152,11 @@ describe('TransactionsService.apply — missing transaction', () => {
 describe('TransactionsService merchant scoping', () => {
   it('createDraft persists merchantId when supplied', async () => {
     const create = jest.fn().mockResolvedValue({ id: 't1' });
-    const prisma = { transaction: { create } } as unknown as PrismaService;
+    const prisma = {
+      transaction: { create },
+      // createDraft probes the user mirror for the SELLER flag grant.
+      user: { findUnique: jest.fn().mockResolvedValue(null), update: jest.fn() },
+    } as unknown as PrismaService;
     const svc = new TransactionsService(prisma, stubOutbound);
     await svc.createDraft({ sellerId: 's1', title: 'x', amount: 1000, merchantId: 'm1' });
     expect(create.mock.calls[0][0].data.merchantId).toBe('m1');

@@ -160,6 +160,22 @@ Migrations use `DIRECT_URL`. Runtime uses `DATABASE_URL`. Don't swap them.
   §7 of the readiness doc — needs Paystack recipient/subaccount onboarding call).
 - **common/paystack/** — done. `PaystackService`: typed HTTP client (init/verify/
   transfer/subaccount) + HMAC-SHA512 webhook-signature verify. Single Paystack seam.
+- **payments/ reconciliation** — done. `PaymentReconcileService` (wired into the
+  cron ahead of the auto-release scan) re-verifies every PENDING charge older
+  than `PAYMENT_RECONCILE_AFTER_SECONDS` (default 900) through the SAME
+  server-verify + protect seam the webhook uses (`PaymentsService.reconcilePayment`
+  resolves the right reference per shape — our `providerReference` for a hosted
+  charge, the bound `providerChargeReference` for a DVA charge). Closes the hole
+  where a payment that really succeeded at Paystack was stranded because BOTH the
+  signed webhook AND the buyer's browser-return verify were missed. Idempotent, no
+  fund movement — it only lets a genuine payment reach PAYMENT_PROTECTED.
+- **transactions/ seller flag** — done. `createDraft` now grants the creator the
+  `SELLER` roleFlag (server-owned, read-then-set so a concurrent grant can't
+  duplicate it). Before this, `roleFlags` was seeded only from a Supabase JWT
+  `app_metadata.role` at mirror-create and nothing granted it later — so a user
+  who sold without that claim had `isSeller=false`, the frontend dashboard
+  queried `role=buyer`, and their own sale was invisible to them.
+
 - **payments/** — done. `initializeCollection` drives BUYER_INITIATE_CHECKOUT +
   opens a Paystack charge; `verifyAndProtect` does server-side verify, amount-match
   hard stop, idempotent (SUCCESS = no-op), then drives PAYMENT_VERIFIED with a

@@ -59,8 +59,18 @@ envVarGroups:
       # --- business config ---
       - key: QUEUE_PREFIX
         value: meduman
+      # Process BullMQ jobs inside the API process. false = the dedicated
+      # meduman-worker service below owns the queues (production posture).
+      # Flip to true only to run without that service.
+      - key: RUN_EMBEDDED_WORKER
+        value: false
       - key: AUTO_RELEASE_WINDOW_HOURS
         value: 72
+      # A PENDING charge older than this is re-verified server-side by the cron, so
+      # a payment that succeeded while BOTH the webhook and the buyer's browser
+      # return were missed still protects instead of stranding the buyer's money.
+      - key: PAYMENT_RECONCILE_AFTER_SECONDS
+        value: 900
       - key: OTP_LENGTH
         value: 6
       - key: OTP_TTL_SECONDS
