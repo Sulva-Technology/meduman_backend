@@ -22,6 +22,8 @@ import { ChatEvidenceService } from './evidence/chat-evidence.service';
 import { ChatOutboundService } from './outbound/chat-outbound.service';
 import { ChatInboundService } from './gateway/chat-inbound.service';
 import { ChatWebhookController } from './gateway/chat-webhook.controller';
+import { AccountMergeService } from './linking/account-merge.service';
+import { ChatLinkService } from './linking/chat-link.service';
 
 /**
  * Chat-native bot gateway. Platform-agnostic core (identity, session, dialog,
@@ -127,7 +129,9 @@ import { ChatWebhookController } from './gateway/chat-webhook.controller';
     ChatEvidenceService,
     ChatOutboundService,
     ChatInboundService,
+    AccountMergeService,
+    ChatLinkService,
   ],
-  exports: [ChatInboundService, ChatOutboundService],
+  exports: [ChatInboundService, ChatOutboundService, ChatLinkService],
 })
 export class ChatModule {}

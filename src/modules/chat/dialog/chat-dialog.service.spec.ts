@@ -74,6 +74,11 @@ function makeDeps() {
     capture,
   } as unknown as import('../evidence/chat-evidence.service').ChatEvidenceService;
 
+  const consume = jest.fn();
+  const links = {
+    consume,
+  } as unknown as import('../linking/chat-link.service').ChatLinkService;
+
   const service = new ChatDialogService(
     prisma,
     sessions,
@@ -84,6 +89,7 @@ function makeDeps() {
     disputes,
     queue,
     evidence,
+    links,
   );
   return {
     service,
@@ -97,6 +103,7 @@ function makeDeps() {
     raise,
     enqueueRelease,
     capture,
+    consume,
     txFindUnique,
     txFindFirst,
     disputeFindUnique,
@@ -371,5 +378,81 @@ describe('ChatDialogService — buyer confirms with an OTP', () => {
     expect(apply).not.toHaveBeenCalled();
     expect(enqueueRelease).not.toHaveBeenCalled();
     expect(reply.text.toLowerCase()).toContain('invalid');
+  });
+});
+
+describe('ChatDialogService /connect', () => {
+  it('links on a valid code', async () => {
+    const { service, consume } = makeDeps();
+    consume.mockResolvedValue({ status: 'LINKED', platform: 'TELEGRAM' });
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm1',
+      from: '555',
+      text: '/connect ABCD2345',
+    } as never);
+    expect(consume).toHaveBeenCalledWith(IDENTITY, 'ABCD2345');
+    expect(reply.text).toContain('Linked');
+  });
+
+  it('asks for the code when none is given', async () => {
+    const { service, consume } = makeDeps();
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm2',
+      from: '555',
+      text: '/connect',
+    } as never);
+    expect(consume).not.toHaveBeenCalled();
+    expect(reply.text).toContain('/connect');
+  });
+
+  it('never discloses why a code failed', async () => {
+    const { service, consume } = makeDeps();
+    consume.mockResolvedValue({ status: 'INVALID' });
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm3',
+      from: '555',
+      text: '/connect ZZZZ9999',
+    } as never);
+    expect(reply.text).not.toMatch(/expired|already used|no such/i);
+    expect(reply.text).toContain("isn't valid");
+  });
+
+  it('explains a transient refusal and invites a retry', async () => {
+    const { service, consume } = makeDeps();
+    consume.mockResolvedValue({ status: 'RETRY' });
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm4',
+      from: '555',
+      text: '/connect ABCD2345',
+    } as never);
+    expect(reply.text).toMatch(/try .*again/i);
+  });
+
+  it('says a collision is under review rather than failing', async () => {
+    const { service, consume } = makeDeps();
+    consume.mockResolvedValue({ status: 'PENDING_REVIEW', reason: 'SELLER_PROFILE_CONFLICT' });
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm5',
+      from: '555',
+      text: '/connect ABCD2345',
+    } as never);
+    expect(reply.text).toMatch(/review/i);
+  });
+
+  it('reports an already-linked chat without merging again', async () => {
+    const { service, consume } = makeDeps();
+    consume.mockResolvedValue({ status: 'ALREADY_LINKED' });
+    const reply = await service.handle(IDENTITY, USER, session(ChatStep.IDLE), {
+      platform: 'TELEGRAM',
+      providerMessageId: 'm6',
+      from: '555',
+      text: '/connect ABCD2345',
+    } as never);
+    expect(reply.text).toContain('Already linked');
   });
 });
