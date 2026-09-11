@@ -96,6 +96,17 @@ export const envSchema = z.object({
   /// How long a dialog session stays live between messages.
   CHAT_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(3_600),
 
+  // Chat↔web account linking
+  /// Server-side key for the chat-link code HMAC. Required — a plain digest of an
+  /// 8-char code is brute-forceable from a DB leak.
+  CHAT_LINK_HASH_SECRET: z.string().min(32),
+  /// Length of a link code, drawn from a 32-char unambiguous alphabet.
+  CHAT_LINK_CODE_LENGTH: z.coerce.number().int().min(6).max(12).default(8),
+  /// How long a minted link code stays valid.
+  CHAT_LINK_CODE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+  /// Max wrong /connect attempts against one code before it locks.
+  CHAT_LINK_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+
   // Meta chat surfaces (WhatsApp / Instagram / Messenger). One Graph app secret +
   // verify token cover all three; each platform additionally needs its own
   // access token + sender id. A platform whose set is incomplete is simply not
