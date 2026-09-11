@@ -110,11 +110,20 @@ export class AccountMergeService {
   async merge(
     sourceUserId: string,
     targetUserId: string,
-    opts: { keepProfile?: 'TARGET' | 'SOURCE' } = {},
+    opts: {
+      keepProfile?: 'TARGET' | 'SOURCE';
+      /**
+       * An admin's explicit ruling that a SELLER_PROFILE_CONFLICT is acceptable —
+       * they have chosen which profile survives, so the guard no longer has a
+       * decision to make. Deliberately NOT widened to SELF_TRANSACTION_CONFLICT:
+       * no choice of profile makes one user a valid counterparty to themselves.
+       */
+      overrideCollision?: 'SELLER_PROFILE_CONFLICT';
+    } = {},
   ): Promise<MergeReport> {
     return this.prisma.$transaction(async (db) => {
       const collision = await this.detectCollision(sourceUserId, targetUserId, db);
-      if (collision) {
+      if (collision && collision !== opts.overrideCollision) {
         throw new LinkMergeCollisionError(collision);
       }
       if (await this.hasInFlightPayout([sourceUserId, targetUserId], db)) {

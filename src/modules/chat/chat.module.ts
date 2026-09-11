@@ -25,6 +25,7 @@ import { ChatWebhookController } from './gateway/chat-webhook.controller';
 import { AccountMergeService } from './linking/account-merge.service';
 import { ChatLinkService } from './linking/chat-link.service';
 import { ChatLinkController } from './linking/chat-link.controller';
+import { ChatLinkAdminController } from './linking/chat-link-admin.controller';
 
 /**
  * Chat-native bot gateway. Platform-agnostic core (identity, session, dialog,
@@ -44,7 +45,7 @@ import { ChatLinkController } from './linking/chat-link.controller';
     DisputesModule,
     StorageModule,
   ],
-  controllers: [ChatWebhookController, ChatLinkController],
+  controllers: [ChatWebhookController, ChatLinkController, ChatLinkAdminController],
   providers: [
     {
       // Collect every configured adapter. Each registers only when its full

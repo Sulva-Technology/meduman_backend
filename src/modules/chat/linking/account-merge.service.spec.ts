@@ -238,4 +238,20 @@ describe('AccountMergeService.merge', () => {
     await expect(service.merge('src', 'tgt')).rejects.toThrow(LinkMergeInFlightError);
     expect(db.chatIdentity.updateMany).not.toHaveBeenCalled();
   });
+
+  it('admits an admin-overridden SELLER_PROFILE_CONFLICT and merges', async () => {
+    db.sellerProfile.findUnique.mockResolvedValue({ id: 'sp' });
+    await expect(
+      service.merge('src', 'tgt', { overrideCollision: 'SELLER_PROFILE_CONFLICT' }),
+    ).resolves.toBeDefined();
+    expect(db.chatIdentity.updateMany).toHaveBeenCalled();
+  });
+
+  it('NEVER lets an override admit a SELF_TRANSACTION_CONFLICT', async () => {
+    db.transaction.findFirst.mockResolvedValue({ id: 'tx-1' });
+    await expect(
+      service.merge('src', 'tgt', { overrideCollision: 'SELLER_PROFILE_CONFLICT' }),
+    ).rejects.toThrow(LinkMergeCollisionError);
+    expect(db.chatIdentity.updateMany).not.toHaveBeenCalled();
+  });
 });

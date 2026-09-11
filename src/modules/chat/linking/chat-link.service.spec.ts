@@ -249,3 +249,110 @@ describe('ChatLinkService.consume', () => {
     });
   });
 });
+
+describe('ChatLinkService admin surface', () => {
+  let service: ChatLinkService;
+  let prisma: {
+    chatLinkRequest: { findMany: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
+    chatIdentity: { findUniqueOrThrow: jest.Mock };
+  };
+  let merge: { merge: jest.Mock };
+  let audit: { log: jest.Mock };
+
+  const request = {
+    id: 'req-1',
+    codeHash: 'deadbeef',
+    status: 'PENDING_REVIEW',
+    conflictReason: 'SELLER_PROFILE_CONFLICT',
+    sourceUserId: 'src-user',
+    targetUserId: 'tgt-user',
+    chatIdentityId: 'id-1',
+  };
+
+  beforeEach(async () => {
+    prisma = {
+      chatLinkRequest: {
+        findMany: jest.fn().mockResolvedValue([request]),
+        findUnique: jest.fn().mockResolvedValue(request),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      chatIdentity: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'id-1', platform: 'TELEGRAM' }),
+      },
+    };
+    merge = { merge: jest.fn().mockResolvedValue({ chatIdentities: 1 }) };
+    audit = { log: jest.fn().mockResolvedValue(undefined) };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        ChatLinkService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: ConfigService, useValue: config },
+        { provide: AuditService, useValue: audit },
+        { provide: AccountMergeService, useValue: merge },
+      ],
+    }).compile();
+    service = moduleRef.get(ChatLinkService);
+  });
+
+  it('never returns the code hash from the review queue', async () => {
+    const { items } = await service.listForReview({});
+    expect(items).toHaveLength(1);
+    expect(items[0]).not.toHaveProperty('codeHash');
+    expect(JSON.stringify(items)).not.toContain('deadbeef');
+  });
+
+  it('defaults the review queue to PENDING_REVIEW', async () => {
+    await service.listForReview({});
+    expect(prisma.chatLinkRequest.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { status: 'PENDING_REVIEW' } }),
+    );
+  });
+
+  it('rejects a request without merging anything', async () => {
+    await expect(
+      service.resolve('req-1', 'REJECT', { adminId: 'admin-1' }),
+    ).resolves.toEqual({ status: 'REJECTED' });
+    expect(merge.merge).not.toHaveBeenCalled();
+    expect(prisma.chatLinkRequest.update).toHaveBeenCalledWith({
+      where: { id: 'req-1' },
+      data: expect.objectContaining({ status: 'REJECTED', resolvedBy: 'admin-1' }),
+    });
+  });
+
+  it('completes a SELLER_PROFILE_CONFLICT with the override the admin earned', async () => {
+    await service.resolve('req-1', 'COMPLETE', { keepProfile: 'TARGET', adminId: 'admin-1' });
+    expect(merge.merge).toHaveBeenCalledWith('src-user', 'tgt-user', {
+      keepProfile: 'TARGET',
+      overrideCollision: 'SELLER_PROFILE_CONFLICT',
+    });
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'chat.link_request_completed', actorId: 'admin-1' }),
+    );
+  });
+
+  it('refuses to COMPLETE a SELF_TRANSACTION_CONFLICT — reject is the only way', async () => {
+    prisma.chatLinkRequest.findUnique.mockResolvedValue({
+      ...request,
+      conflictReason: 'SELF_TRANSACTION_CONFLICT',
+    });
+    await expect(
+      service.resolve('req-1', 'COMPLETE', { keepProfile: 'TARGET', adminId: 'admin-1' }),
+    ).rejects.toThrow(/reject it instead/);
+    expect(merge.merge).not.toHaveBeenCalled();
+  });
+
+  it('requires a winning profile to COMPLETE', async () => {
+    await expect(
+      service.resolve('req-1', 'COMPLETE', { adminId: 'admin-1' }),
+    ).rejects.toThrow(/keepProfile is required/);
+    expect(merge.merge).not.toHaveBeenCalled();
+  });
+
+  it('409s a request that is not parked for review', async () => {
+    prisma.chatLinkRequest.findUnique.mockResolvedValue({ ...request, status: 'COMPLETED' });
+    await expect(service.resolve('req-1', 'REJECT', { adminId: 'admin-1' })).rejects.toThrow(
+      /not PENDING_REVIEW/,
+    );
+  });
+});
