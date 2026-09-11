@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { PayoutStatus, type Prisma } from '@prisma/client';
+import { ActorType, PayoutStatus, UserStatus, type Prisma } from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
+import { AuditService } from '@/modules/audit/audit.service';
+import { LinkMergeCollisionError, LinkMergeInFlightError } from './linking.errors';
 
 /** A collision that refuses the merge and parks it for an admin. */
 export type MergeCollisionKind = 'SELLER_PROFILE_CONFLICT' | 'SELF_TRANSACTION_CONFLICT';
@@ -18,6 +20,21 @@ export type MergeDb = Pick<
 /** Payout statuses that mean a transfer may be in flight right now. */
 const NON_TERMINAL_PAYOUT: PayoutStatus[] = [PayoutStatus.PENDING, PayoutStatus.PROCESSING];
 
+/** What a completed merge moved. Logged to the audit row; returned to the caller. */
+export interface MergeReport {
+  chatIdentities: number;
+  transactionsSold: number;
+  transactionsBought: number;
+  payouts: number;
+  invoicesSold: number;
+  invoicesBought: number;
+  notifications: number;
+  disputes: number;
+  evidence: number;
+  profileMerged: boolean;
+  sellerProfileMoved: boolean;
+}
+
 /**
  * Merges an absorbed chat-born account into a real account.
  *
@@ -26,7 +43,10 @@ const NON_TERMINAL_PAYOUT: PayoutStatus[] = [PayoutStatus.PENDING, PayoutStatus.
  */
 @Injectable()
 export class AccountMergeService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   /**
    * Hard collisions. Both mean the merge would produce an account the domain
@@ -78,5 +98,186 @@ export class AccountMergeService {
       where: { sellerId: { in: userIds }, status: { in: NON_TERMINAL_PAYOUT } },
     });
     return inFlight !== null;
+  }
+
+  /**
+   * Absorb `sourceUserId` into `targetUserId` in ONE transaction. Either every
+   * row moves and the tombstone is set, or nothing does.
+   *
+   * The guards re-run inside the transaction: checking outside would leave a
+   * window in which a row could be created and slip past the check.
+   */
+  async merge(
+    sourceUserId: string,
+    targetUserId: string,
+    opts: { keepProfile?: 'TARGET' | 'SOURCE' } = {},
+  ): Promise<MergeReport> {
+    return this.prisma.$transaction(async (db) => {
+      const collision = await this.detectCollision(sourceUserId, targetUserId, db);
+      if (collision) {
+        throw new LinkMergeCollisionError(collision);
+      }
+      if (await this.hasInFlightPayout([sourceUserId, targetUserId], db)) {
+        throw new LinkMergeInFlightError();
+      }
+
+      const source = await db.user.findUniqueOrThrow({ where: { id: sourceUserId } });
+      const target = await db.user.findUniqueOrThrow({ where: { id: targetUserId } });
+
+      // 1. Identities. A user may have linked more than one platform to the
+      //    throwaway, so this is updateMany, not a single row.
+      const identities = await db.chatIdentity.updateMany({
+        where: { userId: sourceUserId },
+        data: { userId: targetUserId },
+      });
+
+      // 2. Money ownership travels with the account.
+      const transactionsSold = await db.transaction.updateMany({
+        where: { sellerId: sourceUserId },
+        data: { sellerId: targetUserId },
+      });
+      const transactionsBought = await db.transaction.updateMany({
+        where: { buyerId: sourceUserId },
+        data: { buyerId: targetUserId },
+      });
+      const payouts = await db.payout.updateMany({
+        where: { sellerId: sourceUserId },
+        data: { sellerId: targetUserId },
+      });
+      const invoicesSold = await db.invoice.updateMany({
+        where: { sellerId: sourceUserId },
+        data: { sellerId: targetUserId },
+      });
+      const invoicesBought = await db.invoice.updateMany({
+        where: { buyerId: sourceUserId },
+        data: { buyerId: targetUserId },
+      });
+      const notifications = await db.notification.updateMany({
+        where: { userId: sourceUserId },
+        data: { userId: targetUserId },
+      });
+
+      // 3. Functional participant references. Polymorphic ids rather than FKs, but
+      //    they back participant/ownership checks, so they must follow the
+      //    account. AuditLog / TimelineEvent actors below are deliberately NOT
+      //    touched — those are immutable history (rule 6).
+      const disputes = await db.dispute.updateMany({
+        where: { openedBy: sourceUserId },
+        data: { openedBy: targetUserId },
+      });
+      const evidence = await db.evidence.updateMany({
+        where: { uploadedBy: sourceUserId },
+        data: { uploadedBy: targetUserId },
+      });
+
+      // 4. Profile is 1:1 with a unique userId — the two rows cannot coexist.
+      const profileMerged = await this.mergeProfile(db, sourceUserId, targetUserId, opts);
+
+      // 5. SellerProfile is 1:1 too. Only reachable when the target has none —
+      //    two would have been a SELLER_PROFILE_CONFLICT above.
+      const sourceSeller = await db.sellerProfile.findUnique({ where: { userId: sourceUserId } });
+      let sellerProfileMoved = false;
+      if (sourceSeller) {
+        await db.sellerProfile.update({
+          where: { userId: sourceUserId },
+          data: { userId: targetUserId },
+        });
+        sellerProfileMoved = true;
+      }
+
+      // 6. Surviving user fields. The target's own values always win; the source
+      //    only fills gaps.
+      await db.user.update({
+        where: { id: targetUserId },
+        data: {
+          roleFlags: { set: [...new Set([...target.roleFlags, ...source.roleFlags])] },
+          ...(target.phone ?? source.phone ? { phone: target.phone ?? source.phone } : {}),
+        },
+      });
+
+      // 7. Tombstone — never a hard delete (legal retention; Payout.sellerId and
+      //    Invoice.sellerId are Restrict FKs, and audit actors still reference it).
+      await db.user.update({
+        where: { id: sourceUserId },
+        data: {
+          status: UserStatus.DEACTIVATED,
+          mergedIntoUserId: targetUserId,
+          mergedAt: new Date(),
+        },
+      });
+
+      const report: MergeReport = {
+        chatIdentities: identities.count,
+        transactionsSold: transactionsSold.count,
+        transactionsBought: transactionsBought.count,
+        payouts: payouts.count,
+        invoicesSold: invoicesSold.count,
+        invoicesBought: invoicesBought.count,
+        notifications: notifications.count,
+        disputes: disputes.count,
+        evidence: evidence.count,
+        profileMerged,
+        sellerProfileMoved,
+      };
+
+      // 8. Rule 6. The row counts make the merge auditable after the fact.
+      await this.audit.log(
+        {
+          action: 'chat.account_linked',
+          targetType: 'User',
+          targetId: targetUserId,
+          actorId: targetUserId,
+          actorType: ActorType.USER,
+          metadata: { sourceUserId, ...report },
+        },
+        db,
+      );
+
+      return report;
+    });
+  }
+
+  /**
+   * Move or fold the 1:1 profile. `keepProfile: 'SOURCE'` is the admin's explicit
+   * choice in a review; the default keeps the target's values and fills only its
+   * nulls.
+   */
+  private async mergeProfile(
+    db: Prisma.TransactionClient,
+    sourceUserId: string,
+    targetUserId: string,
+    opts: { keepProfile?: 'TARGET' | 'SOURCE' },
+  ): Promise<boolean> {
+    const source = await db.profile.findUnique({ where: { userId: sourceUserId } });
+    if (!source) {
+      return false;
+    }
+    const target = await db.profile.findUnique({ where: { userId: targetUserId } });
+
+    if (!target) {
+      await db.profile.update({ where: { userId: sourceUserId }, data: { userId: targetUserId } });
+      return true;
+    }
+
+    const winner = opts.keepProfile === 'SOURCE' ? source : target;
+    const loser = opts.keepProfile === 'SOURCE' ? target : source;
+
+    // A Json column has no useful field-wise merge, so carry over whichever side
+    // set one and leave the target's own value alone if neither did. The key is
+    // omitted rather than set to undefined — `exactOptionalPropertyTypes` is on.
+    const channelLinks = winner.channelLinks ?? loser.channelLinks;
+
+    await db.profile.update({
+      where: { userId: targetUserId },
+      data: {
+        country: winner.country ?? loser.country,
+        city: winner.city ?? loser.city,
+        avatarUrl: winner.avatarUrl ?? loser.avatarUrl,
+        bio: winner.bio ?? loser.bio,
+        ...(channelLinks ? { channelLinks } : {}),
+      },
+    });
+    await db.profile.delete({ where: { userId: sourceUserId } });
+    return true;
   }
 }
