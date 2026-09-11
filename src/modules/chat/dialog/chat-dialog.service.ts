@@ -555,10 +555,7 @@ export class ChatDialogService {
    * was wrong, expired or already used — so the chat is not an oracle for
    * guessing codes.
    */
-  private async connectAccount(
-    identity: ChatIdentity,
-    arg: string,
-  ): Promise<OutboundChatMessage> {
+  private async connectAccount(identity: ChatIdentity, arg: string): Promise<OutboundChatMessage> {
     if (!arg) {
       return {
         text: 'Send the code from your Meduman account page, e.g. /connect ABCD2345',

@@ -37,9 +37,7 @@ describe('PaymentReconcileService', () => {
 
     const where = payment.findMany.mock.calls[0][0].where;
     expect(where.status).toBe(PaymentStatus.PENDING);
-    expect(where.createdAt.lt).toEqual(
-      new Date(now.getTime() - THRESHOLD_SECONDS * 1000),
-    );
+    expect(where.createdAt.lt).toEqual(new Date(now.getTime() - THRESHOLD_SECONDS * 1000));
   });
 
   it('counts a payment that reconciles to SUCCESS', async () => {
