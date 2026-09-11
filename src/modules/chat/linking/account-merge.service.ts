@@ -182,16 +182,28 @@ export class AccountMergeService {
       // 4. Profile is 1:1 with a unique userId — the two rows cannot coexist.
       const profileMerged = await this.mergeProfile(db, sourceUserId, targetUserId, opts);
 
-      // 5. SellerProfile is 1:1 too. Only reachable when the target has none —
-      //    two would have been a SELLER_PROFILE_CONFLICT above.
+      // 5. SellerProfile is 1:1 too. Two of them is a SELLER_PROFILE_CONFLICT — the
+      //    only way past that guard is an admin's explicit override, and they have
+      //    already chosen whose payout destination survives.
       const sourceSeller = await db.sellerProfile.findUnique({ where: { userId: sourceUserId } });
       let sellerProfileMoved = false;
       if (sourceSeller) {
-        await db.sellerProfile.update({
-          where: { userId: sourceUserId },
-          data: { userId: targetUserId },
+        const targetSeller = await db.sellerProfile.findUnique({
+          where: { userId: targetUserId },
         });
-        sellerProfileMoved = true;
+        if (targetSeller) {
+          // One account cannot hold two payout destinations. The survivor keeps its
+          // own; the absorbed account's is discarded rather than left behind with a
+          // live `providerRecipientCode` that a later path could read (rule 4). The
+          // transfers it already made survive in the Payout rows.
+          await db.sellerProfile.delete({ where: { userId: sourceUserId } });
+        } else {
+          await db.sellerProfile.update({
+            where: { userId: sourceUserId },
+            data: { userId: targetUserId },
+          });
+          sellerProfileMoved = true;
+        }
       }
 
       // 6. Surviving user fields. The target's own values always win; the source
@@ -200,7 +212,7 @@ export class AccountMergeService {
         where: { id: targetUserId },
         data: {
           roleFlags: { set: [...new Set([...target.roleFlags, ...source.roleFlags])] },
-          ...(target.phone ?? source.phone ? { phone: target.phone ?? source.phone } : {}),
+          ...((target.phone ?? source.phone) ? { phone: target.phone ?? source.phone } : {}),
         },
       });
 

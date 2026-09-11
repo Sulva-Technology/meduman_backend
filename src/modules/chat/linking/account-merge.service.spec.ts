@@ -89,6 +89,7 @@ describe('AccountMergeService.merge', () => {
       sellerProfile: {
         findUnique: jest.fn().mockResolvedValue(null),
         update: jest.fn().mockResolvedValue({}),
+        delete: jest.fn().mockResolvedValue({}),
       },
       transaction: { findFirst: jest.fn().mockResolvedValue(null), updateMany: updateMany() },
       invoice: { findFirst: jest.fn().mockResolvedValue(null), updateMany: updateMany() },
@@ -253,5 +254,20 @@ describe('AccountMergeService.merge', () => {
       service.merge('src', 'tgt', { overrideCollision: 'SELLER_PROFILE_CONFLICT' }),
     ).rejects.toThrow(LinkMergeCollisionError);
     expect(db.chatIdentity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('discards the losing payout destination when an admin overrides a seller conflict', async () => {
+    // Both sides own a SellerProfile — the state an override exists for. The
+    // source's row cannot be re-pointed at the target (userId is unique), so the
+    // only way to leave one destination standing is to delete it.
+    db.sellerProfile.findUnique.mockResolvedValue({ id: 'sp', providerRecipientCode: 'RCP_src' });
+    await service.merge('src', 'tgt', { overrideCollision: 'SELLER_PROFILE_CONFLICT' });
+
+    expect(db.sellerProfile.delete).toHaveBeenCalledWith({ where: { userId: 'src' } });
+    expect(db.sellerProfile.update).not.toHaveBeenCalled();
+    expect(db.chatIdentity.updateMany).toHaveBeenCalledWith({
+      where: { userId: 'src' },
+      data: { userId: 'tgt' },
+    });
   });
 });
