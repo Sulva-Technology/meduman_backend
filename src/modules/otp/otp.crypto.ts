@@ -1,4 +1,6 @@
-import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomInt } from 'node:crypto';
+
+export { timingSafeEqualHex } from '@/common/crypto/timing-safe';
 
 /**
  * OTP crypto primitives. Pure and dependency-free (only Node's crypto), so the
@@ -26,17 +28,4 @@ export function generateNumericCode(length: number): string {
 /** Keyed HMAC-SHA256 of the code, hex-encoded. Deterministic per (code, secret). */
 export function hashCode(code: string, secret: string): string {
   return createHmac('sha256', secret).update(code).digest('hex');
-}
-
-/**
- * Constant-time comparison of two hex strings. Returns false (never throws) when
- * lengths differ, so a mismatched candidate can't leak timing about the stored hash.
- */
-export function timingSafeEqualHex(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, 'hex');
-  const bufB = Buffer.from(b, 'hex');
-  if (bufA.length !== bufB.length) {
-    return false;
-  }
-  return timingSafeEqual(bufA, bufB);
 }
