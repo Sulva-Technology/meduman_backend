@@ -33,9 +33,11 @@ describe('ChatLinkService.mint', () => {
     prisma = {
       chatLinkRequest: {
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
-        create: jest.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) =>
-          Promise.resolve({ id: 'req-1', ...data }),
-        ),
+        create: jest
+          .fn()
+          .mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+            Promise.resolve({ id: 'req-1', ...data }),
+          ),
       },
     };
     audit = { log: jest.fn().mockResolvedValue(undefined) };
@@ -310,9 +312,9 @@ describe('ChatLinkService admin surface', () => {
   });
 
   it('rejects a request without merging anything', async () => {
-    await expect(
-      service.resolve('req-1', 'REJECT', { adminId: 'admin-1' }),
-    ).resolves.toEqual({ status: 'REJECTED' });
+    await expect(service.resolve('req-1', 'REJECT', { adminId: 'admin-1' })).resolves.toEqual({
+      status: 'REJECTED',
+    });
     expect(merge.merge).not.toHaveBeenCalled();
     expect(prisma.chatLinkRequest.update).toHaveBeenCalledWith({
       where: { id: 'req-1' },
@@ -343,9 +345,9 @@ describe('ChatLinkService admin surface', () => {
   });
 
   it('requires a winning profile to COMPLETE', async () => {
-    await expect(
-      service.resolve('req-1', 'COMPLETE', { adminId: 'admin-1' }),
-    ).rejects.toThrow(/keepProfile is required/);
+    await expect(service.resolve('req-1', 'COMPLETE', { adminId: 'admin-1' })).rejects.toThrow(
+      /keepProfile is required/,
+    );
     expect(merge.merge).not.toHaveBeenCalled();
   });
 

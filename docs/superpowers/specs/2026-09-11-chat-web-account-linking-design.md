@@ -232,8 +232,16 @@ Then, in one `$transaction`:
    If both have one, merge field-wise into the survivor's — fill only its null
    fields (`country`, `city`, `avatarUrl`, `bio`, `channelLinks`) — then delete
    the throwaway's. They cannot coexist.
-5. **`SellerProfile` (1:1).** Only reachable in the non-collision branch, where
-   the survivor has none — so move it wholesale.
+5. **`SellerProfile` (1:1).** Reachable in two shapes:
+   - *Survivor has none* — move the throwaway's wholesale.
+   - *Both have one* — only reachable when the guard above was **overridden by an
+     admin** (see [Admin surface](#admin-surface)). One account cannot hold two
+     payout destinations, and the throwaway's row cannot be re-pointed at the
+     survivor because `SellerProfile.userId` is `@unique`. So the survivor keeps
+     its own destination and the throwaway's row is **deleted**. Leaving it behind
+     with a live `providerRecipientCode` would be a rule 4 hazard — any later path
+     that reads a destination from a profile could find a deactivated account's.
+     The transfers that account already made survive in the `Payout` rows.
 6. **`User` fields.** `roleFlags` = set-union. `phone` = fill only if the
    survivor's is null. A chat-born user created with `email_confirm: false` has a
    synthetic address; the survivor's real email is never touched.
@@ -270,12 +278,31 @@ POST /admin/chat/link-requests/:id/resolve
 
 `@Roles('ADMIN')`, throttled, every call audited.
 
-`COMPLETE` re-runs the merge algorithm with `keepProfile` deciding the seller
-profile in a `SELLER_PROFILE_CONFLICT` (delete or archive the loser — the loser's
-`providerRecipientCode` is nulled, never silently reused). `SELF_TRANSACTION_CONFLICT`
+`COMPLETE` re-runs the merge algorithm with `keepProfile` deciding which seller
+profile survives a `SELLER_PROFILE_CONFLICT`. The loser's `SellerProfile` is
+**deleted, never silently reused** — see step 5 of the merge algorithm.
+`SELF_TRANSACTION_CONFLICT`
 is **not** resolvable by an admin — no `keepProfile` makes a valid escrow, so the
 endpoint returns 409 and the request must be `REJECT`ed. `REJECT` sets
-`REJECTED`, notifies the user in chat, and writes nothing else.
+`REJECTED` and writes nothing else.
+
+### As built — one addition the merge algorithm needed
+
+`merge` re-runs its own precondition checks inside the transaction, so it would
+refuse the very conflict the admin is resolving. It therefore takes an
+`overrideCollision?: 'SELLER_PROFILE_CONFLICT'` option, and the admin `COMPLETE`
+path passes it. It is **narrowed to that one kind on purpose**:
+`SELF_TRANSACTION_CONFLICT` stays unoverridable *and* unresolvable, because no
+choice of profile makes one user a valid counterparty to themselves. A unit test
+asserts the narrowing holds.
+
+### As built — one gap against this spec
+
+`REJECT` does **not** notify the user in chat. The spec asks for it; the plan's
+task list did not, and it is not implemented. The user is left with a code that
+reports "invalid" and a `link-status` of `underReview: false`. Not a money-safety
+issue, but it is a real behavioural difference from this document — either wire a
+`ChatOutboundService` push on reject, or drop the requirement here.
 
 ## Money-safety analysis
 

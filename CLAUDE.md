@@ -478,19 +478,71 @@ Migrations use `DIRECT_URL`. Runtime uses `DATABASE_URL`. Don't swap them.
   at send) + blocking 0.0.0.0 / IPv4-mapped IPv6 are follow-ups before external
   merchants point live URLs at us.
 
+- **chat/ account linking — done (code); e2e authored but NOT executed.** Links a
+  chat-born throwaway account to the real web account it belongs to. Design:
+  [`docs/superpowers/specs/2026-09-11-chat-web-account-linking-design.md`](docs/superpowers/specs/2026-09-11-chat-web-account-linking-design.md).
+  An authenticated web user mints a short-lived single-use code
+  (`POST /chat/link-code`); they type it into the bot as `/connect <code>`. The
+  code is stored ONLY as a keyed HMAC-SHA256 (`ChatLinkRequest.codeHash`, keyed by
+  `CHAT_LINK_HASH_SECRET`) — the plaintext is returned once, never logged or
+  audited. Verification is **generic to the client** (no oracle): a wrong, expired,
+  consumed or attempt-capped code all return the same `INVALID`, exactly as the OTP
+  path does; the precise reason goes to the log and audit trail only.
+  `AccountMergeService.merge` absorbs the chat account into the web account in ONE
+  `$transaction` — identities, transactions (bought + sold), payouts, invoices,
+  notifications, disputes and evidence all re-parent; **`TimelineEvent.actorId` and
+  `AuditLog.actorId` are deliberately NOT touched** (immutable history, rule 6),
+  which is why the absorbed account is **TOMBSTONED, never hard-deleted**
+  (`User.status = DEACTIVATED` + `mergedIntoUserId` + `mergedAt`; the relation is
+  `SetNull` so deleting the survivor cannot erase the tombstone) — legal retention.
+  Two hard collisions refuse and park the request as `PENDING_REVIEW` for an admin:
+  `SELLER_PROFILE_CONFLICT` (two payout destinations) and
+  `SELF_TRANSACTION_CONFLICT` (merge would make one user both buyer and seller of
+  the same escrow). An in-flight payout (`PENDING`/`PROCESSING`) is NOT a collision
+  — it refuses **transiently, leaving the code unconsumed**, because the transfer
+  destination is read from the seller profile at send time (rule 4). Admin surface
+  (`@Roles('ADMIN')`): `GET /admin/chat/link-requests` (defaults to
+  `PENDING_REVIEW`; never returns `codeHash`) and
+  `POST /admin/chat/link-requests/:id/resolve` — `REJECT` closes it having written
+  nothing else; `COMPLETE` requires an explicit `keepProfile: 'TARGET'|'SOURCE'`
+  and **409s on `SELF_TRANSACTION_CONFLICT`**, which no profile choice can fix. The
+  admin's ruling is the only thing that admits a `SELLER_PROFILE_CONFLICT`
+  (`merge`'s `overrideCollision`, narrowed to that one kind); the surviving account
+  keeps its own payout destination and the absorbed account's `SellerProfile` is
+  deleted, since one account cannot hold two. Every mint, rejection, completion and
+  the merge itself writes an audit row (rule 6). Additive migration
+  `20260911000000_chat_account_linking` (**UNAPPLIED** — authored offline via
+  `migrate diff --from-schema-datamodel`; the docker daemon is down). Tests: link
+  crypto, mint/consume/replay/expiry/attempt-cap, every collision and race path,
+  the merge re-parenting contract + tombstone, `/connect` dialog, both controllers
+  (52 linking tests) + [`test/chat-account-linking.e2e-spec.ts`](test/chat-account-linking.e2e-spec.ts)
+  (8 money-safety cases — **authored, never run**, no e2e has executed here).
+
 **Status: full spine + chat bot gateway (Telegram + Meta adapters, X stub, DVA
 payments, chat photo/document evidence) + Phase 1 invoicing + EaaS Slice 1
 (merchant tenancy + API-key `/v1`) done and PROVEN
 against a real Postgres +
-Redis — 49 unit suites / 381 tests + 28 e2e (5 suites), lint + build clean.** All eight migrations apply clean to
+Redis — 63 unit suites / 482 tests, lint + build clean. Chat account linking is
+**unit-proven only**: its migration `20260911000000_chat_account_linking` is
+**UNAPPLIED** and its e2e suite has **never executed** (the docker daemon was down
+throughout). The eight earlier migrations apply clean to
 an empty DB; the app boots, `/health` and `/health/ready`
 (`{"db":true,"redis":true}`) return 200, and an unauthenticated protected route
 still 401s. (`ioredis` pinned to `5.10.1` to match bullmq's exact pin.) New env
 since scaffold: `OTP_HASH_SECRET`, `OTP_MAX_ATTEMPTS`, `WEBHOOK_MAX_AGE_SECONDS`,
 `SENTRY_DSN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
 `CHAT_IDENTITY_EMAIL_DOMAIN`, `CHAT_SESSION_TTL_SECONDS`, the `META_*` /
-`WHATSAPP_*` / `MESSENGER_*` / `INSTAGRAM_*` set, `X_ADAPTER_ENABLED`, and
-`EAAS_API_KEY_SECRET`.
+`WHATSAPP_*` / `MESSENGER_*` / `INSTAGRAM_*` set, `X_ADAPTER_ENABLED`,
+`EAAS_API_KEY_SECRET`, and `CHAT_LINK_HASH_SECRET` (+ `CHAT_LINK_CODE_LENGTH`,
+`CHAT_LINK_CODE_TTL_SECONDS`, `CHAT_LINK_MAX_ATTEMPTS`).
+
+**Known-red on `npm test` (pre-existing, NOT from account linking):** 4 tests in
+`src/modules/queue/queue.service.spec.ts` (3) and
+`src/modules/notifications/notifications.service.spec.ts` (1) assert a BullMQ
+`jobId` containing a colon (`release:tx-1`) while the committed service builds a
+dot (`release.tx-1` — BullMQ rejects `:` in a custom job id). The specs are
+unmodified in the tree, so the mismatch is committed. Fixing it means editing job
+ids on the release path, which is money-path idempotency machinery.
 
 **Gotcha worth remembering:** global guards must be registered as
 `{ provide: APP_GUARD, useExisting: SupabaseJwtGuard }` with the class also in

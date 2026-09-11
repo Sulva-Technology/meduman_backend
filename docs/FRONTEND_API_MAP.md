@@ -174,6 +174,7 @@ is in-app. Both call `apply(BUYER_CONFIRM)` server-side then enqueue release.
 | `/admin/transactions/:id` | Tx + timeline + audit log + evidence | ✅ `GET /transactions/:id` (admin allowed) + 🟥 `GET /transactions/:id/audit` (Part B §7) |
 | `/admin/disputes` | Dispute queue | 🟥 `GET /admin/disputes` |
 | `/admin/disputes/:id` | Resolve for seller (release) / buyer (refund) | ✅ `POST /disputes/:id/resolve` |
+| `/admin/link-requests` | Parked chat↔web merges needing a ruling | ✅ `GET /admin/chat/link-requests` + `POST …/:id/resolve` (Part B §11) |
 
 ---
 
@@ -639,6 +640,44 @@ document / PDF** — this backend serves the structured JSON + owns the number.
 
 Phase 2 (direct/non-escrow toggle) and Phase 3 (recurring/batch) are separate,
 not yet built.
+
+---
+
+## §11 — Chat account linking 🔒 / admin 🔒
+
+Built and wired. A user who first met Meduman inside a chat (WhatsApp/Telegram/…)
+has a throwaway account minted by the bot. Linking moves everything they own onto
+the real web account they sign into here, so chat orders appear in their
+dashboard.
+
+Web routes (🔒, the caller can only ever act on their own account):
+
+- `POST /chat/link-code` → `{ code, expiresAt }`. Mints one short-lived
+  single-use code. **The plaintext is returned exactly once** — it is stored only
+  as a keyed HMAC, and is never logged, audited or recoverable. Minting supersedes
+  any earlier live code for that user. Throttled to 5/min. Show it with the
+  instruction *"send `/connect <code>` to the Meduman bot"* and a countdown to
+  `expiresAt`.
+- `GET /chat/link-status` → `{ linked, pendingCode, underReview }`. Non-secret
+  state for the "connect" card: whether any chat account is already linked,
+  whether a code is live, and whether a request is parked for review.
+
+Admin routes (`@Roles('ADMIN')`, rule 6 — every action is audited):
+
+- `GET /admin/chat/link-requests?status=&cursor=&limit=` → the review queue,
+  newest first, defaulting to `PENDING_REVIEW`. **Never returns `codeHash`.**
+- `POST /admin/chat/link-requests/:id/resolve` — body
+  `{ outcome: 'COMPLETE' | 'REJECT', keepProfile?: 'TARGET' | 'SOURCE' }`.
+  `REJECT` closes it having written nothing else. `COMPLETE` needs an explicit
+  `keepProfile` and **409s on a `SELF_TRANSACTION_CONFLICT`** — no profile choice
+  makes one user a valid counterparty to themselves, so reject is the only way out.
+  A request that is not `PENDING_REVIEW` is a 409; an unknown id is a 404.
+
+The user-facing outcome is deliberately vague: a wrong, expired, consumed or
+attempt-capped code all produce the same "that code didn't work" reply, so the
+chat is not an oracle for guessing codes.
+
+---
 
 # Part C — Backend gaps summary (build order)
 

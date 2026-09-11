@@ -127,6 +127,40 @@ npm run db:up && npm run db:migrate:test && npm run test:e2e
       is static (literal-IP); DNS-rebind hardening (resolve-and-pin at send) +
       blocking 0.0.0.0 / IPv4-mapped IPv6 are follow-ups before external merchants
       point live URLs at us.** Both must be set in Render (`sync: false`).
+- [ ] **New env var `CHAT_LINK_HASH_SECRET`** (zod-required, min 32 chars) — keys
+      the HMAC-SHA256 hash-at-rest of every chat↔web link code, alongside
+      `CHAT_LINK_CODE_LENGTH` (8), `CHAT_LINK_CODE_TTL_SECONDS` (600) and
+      `CHAT_LINK_MAX_ATTEMPTS` (5). Set in Render (`sync: false`). Like
+      `OTP_HASH_SECRET`, **rotating it invalidates every live code** (in-flight
+      only — codes expire in 10 minutes, so this is a non-event rather than a
+      re-issue exercise).
+- [x] **Chat account-linking hardening** — the link code follows the OTP pattern
+      exactly: keyed HMAC hash-at-rest (the plaintext is returned once to the
+      authenticated web caller and never persisted, logged or audited), single-use,
+      TTL'd, attempt-capped, constant-time compared, and **generic to the client**
+      (a wrong, expired, consumed or attempt-capped code are indistinguishable, so
+      the bot is not an oracle for guessing codes; the precise reason goes to the
+      log and audit row only). The consume route mints nothing and moves nothing
+      until the code is verified. `GET /admin/chat/link-requests` never returns
+      `codeHash`.
+- [ ] **Account-merge retention — the absorbed account is TOMBSTONED, never
+      hard-deleted.** A chat-born account that is merged into a web account gets
+      `User.status = DEACTIVATED` + `mergedIntoUserId` + `mergedAt`; the row stays
+      so the historical record survives (legal retention), and the durable merge
+      record is the append-only `AuditLog` row (`chat.account_linked`). The
+      `mergedIntoUserId` relation is `onDelete: SetNull` on purpose — deleting the
+      *surviving* account must never erase the tombstone. **Confirm this retention
+      story with whoever owns the Nigerian data-protection posture** (NDPA 2023):
+      a deactivated row holding a phone number and role flags is still personal
+      data, and the merge is arguably a change of purpose that the privacy notice
+      should cover.
+- [ ] **An admin `COMPLETE` on a `SELLER_PROFILE_CONFLICT` deletes the absorbed
+      account's `SellerProfile`** — one account cannot hold two payout
+      destinations, and leaving a live `providerRecipientCode` on a deactivated
+      account is a rule 4 hazard. The transfers it already made survive in the
+      `Payout` rows, but the destination itself is gone. That is a deliberate,
+      audited admin decision, not a silent one — confirm the operations runbook
+      says so.
 
 ## 3. Observability & ops
 
