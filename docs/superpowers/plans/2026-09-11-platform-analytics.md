@@ -1214,8 +1214,14 @@ Implement these seven cases. Cases 2, 3 and 4 are the load-bearing ones.
 
 3. **Withdraw-dispute regression.** Drive `PAYMENT_PROTECTED → DISPUTED → WITHDRAW_DISPUTE`. Assert the transaction still counts in `protected` **and** still counts in `disputed` — the final state is `PAYMENT_PROTECTED`, so a status-based count would lose the dispute entirely.
 
-4. **Stage monotonicity** over a seeded population: assert
-   `created ≥ published ≥ paymentStarted ≥ protected ≥ delivered ≥ released`.
+4. **Stage cumulativity** over a seeded population: assert `created ≥ published ≥
+   paymentStarted ≥ protected`. **Do not assert `delivered ≥ released`** — that is
+   not an invariant of this lifecycle. A dispute resolved for the seller releases
+   without ever being delivered (`DISPUTED → RELEASE_PROCESSING → COMPLETED`, never
+   `CONFIRMATION_PENDING`), so assert that counterexample explicitly: drive the
+   path and assert the transaction counts in `released` and **not** in `delivered`.
+   See `src/modules/analytics/funnel-shape.spec.ts`, which derives the fork from
+   the transition function.
 
 5. **Money.** A protected transaction contributes its `amount` to `protectedVolumeKobo` exactly once; a released one contributes to `releasedVolumeKobo`; `feesKobo` sums `feeAmount` over protected only. Assert the response passes `JSON.stringify` **without throwing** and that each money value is a decimal string. This is the BigInt trap — it only fires with non-empty data, which is exactly why it needs an e2e case rather than a unit one.
 
