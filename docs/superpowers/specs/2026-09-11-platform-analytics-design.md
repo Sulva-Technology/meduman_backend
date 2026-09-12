@@ -158,10 +158,21 @@ had less time to convert. A frontend showing the last 7 days alongside the last
 | `released` | `newState = COMPLETED` |
 | `disputed` | `newState = DISPUTED` |
 
-Stages are cumulative by construction — every path into `PAYMENT_PROTECTED`
-passes through `PAYMENT_PENDING`, so a later-stage count never exceeds an earlier
-one. The stage counts therefore form a monotonically decreasing sequence, and the
-e2e suite asserts that shape.
+Stages are cumulative up to `protected`: every path into `PAYMENT_PROTECTED`
+passes through `PAYMENT_PENDING`, and every path into `PAYMENT_PENDING` passes
+through `LINK_ACTIVE`. Those counts therefore cannot invert, and the funnel is
+safe to render as a funnel down to that column.
+
+**`delivered` and `released` are NOT a chain, and `delivered >= released` is not
+an invariant.** After protection the lifecycle forks: a dispute resolved for the
+seller goes `DISPUTED → RELEASE_PROCESSING → COMPLETED` and never passes through
+`CONFIRMATION_PENDING`. So a cohort containing such a dispute has more released
+transactions than delivered ones, and a chart that assumes the counts narrow all
+the way down will misrender it. Both stages are still honest — each is exactly
+"a timeline row with `newState = <that state>` exists" — which is the point: the
+columns record what happened, and what happened does not always include a
+delivery confirmation. `src/modules/analytics/funnel-shape.spec.ts` derives this
+from the transition function so the correction cannot rot.
 
 ## Metrics
 
@@ -246,8 +257,13 @@ would catch a wrong design:
    PAYMENT_PENDING → PAYMENT_ABANDONED → LINK_ACTIVE`. Assert it is counted in
    `paymentStarted` and **not** in `protected`. This is the case a status-rank
    implementation gets wrong, so it is the test that proves the timeline approach.
-3. **Stage monotonicity.** Over a seeded population, assert
-   `created ≥ published ≥ paymentStarted ≥ protected ≥ delivered ≥ released`.
+3. **Stage cumulativity, not monotonicity.** Over a seeded population, assert
+   `created ≥ published ≥ paymentStarted ≥ protected` — the part that is an
+   invariant. **Do not assert `delivered ≥ released`**: a dispute resolved for the
+   seller releases without ever being delivered (see the funnel table above), so
+   assert the counterexample explicitly instead — a transaction driven
+   `PAYMENT_PROTECTED → DISPUTED → RESOLVE_DISPUTE_FOR_SELLER → PAYOUT_SUCCEEDED`
+   counts in `released` and **not** in `delivered`.
 4. **Withdraw-dispute regression.** Drive `PAYMENT_PROTECTED → DISPUTED →
    WITHDRAW_DISPUTE` and assert the transaction still counts as `protected` and
    still counts in `disputed`.

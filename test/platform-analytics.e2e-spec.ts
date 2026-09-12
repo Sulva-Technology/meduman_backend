@@ -330,7 +330,7 @@ describeE2E('Platform analytics (e2e)', () => {
     expect(web.disputeRate).toBe(1);
   });
 
-  it('stages only ever narrow: created >= published >= started >= protected >= delivered >= released', async () => {
+  it('stages are cumulative up to protected: created >= published >= started >= protected', async () => {
     // A population that spans the funnel, so the inequality is not vacuous.
     await createAndPublish(asWebSeller); // published, never paid
     const paidTx = await createAndPublish(asWebSeller);
@@ -343,12 +343,11 @@ describeE2E('Platform analytics (e2e)', () => {
 
     const body = await analytics();
     for (const r of [...body.platforms, body.totals]) {
+      // Deliberately NOT `delivered >= released` — that is not an invariant.
       expect(
         r.created >= r.published &&
           r.published >= r.paymentStarted &&
-          r.paymentStarted >= r.protected &&
-          r.protected >= r.delivered &&
-          r.delivered >= r.released,
+          r.paymentStarted >= r.protected,
       ).toBe(true);
     }
 
@@ -360,6 +359,44 @@ describeE2E('Platform analytics (e2e)', () => {
     // computed from a separate query.
     expect(body.totals.created).toBe(3);
     expect(body.totals.protected).toBe(2);
+  });
+
+  it('releases without ever delivering when a dispute is resolved for the seller', async () => {
+    // The counterexample to a monotone funnel, and the reason the response is
+    // allowed to show `released > delivered`. After protection the lifecycle
+    // forks: RESOLVE_DISPUTE_FOR_SELLER goes straight to RELEASE_PROCESSING and
+    // never enters CONFIRMATION_PENDING.
+    const txId = await createAndPublish(asWebSeller);
+    await protect(txId);
+    await request(http())
+      .post(`/transactions/${txId}/disputes`)
+      .set(asBuyer)
+      .send({ reason: 'ITEM_NOT_RECEIVED' })
+      .expect(201);
+
+    await ctx.seedSellerRecipient(WEB_SELLER);
+    await apply(txId, { type: 'RESOLVE_DISPUTE_FOR_SELLER' });
+
+    const payouts = ctx.app.get(PayoutsService);
+    await payouts.executeRelease(txId);
+    await payouts.markPaid(releaseIdempotencyKey(txId), 'TRF_e2e_dispute');
+    await apply(txId, { type: 'PAYOUT_SUCCEEDED' });
+
+    const tx = await ctx.prisma.transaction.findUniqueOrThrow({ where: { id: txId } });
+    expect(tx.status).toBe('COMPLETED');
+
+    // It was never delivered...
+    const timeline = await ctx.prisma.timelineEvent.findMany({
+      where: { transactionId: txId },
+      select: { newState: true },
+    });
+    expect(timeline.map((e) => e.newState)).not.toContain('CONFIRMATION_PENDING');
+
+    // ...yet it counts as released. So `released > delivered` is a real shape.
+    const web = row(await analytics(), TransactionOrigin.WEB);
+    expect(web.delivered).toBe(0);
+    expect(web.released).toBe(1);
+    expect(web.released).toBeGreaterThan(web.delivered);
   });
 
   it('sums money once per transaction, as decimal strings, and survives JSON.stringify', async () => {

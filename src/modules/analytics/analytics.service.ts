@@ -33,6 +33,14 @@ export class AnalyticsService {
    * wide the window happens to be — which also means RECENT COHORTS LOOK WORSE,
    * because their transactions have had less time to convert. That is correct,
    * and the frontend must say so.
+   *
+   * The stages are recorded facts, not a chain: counts run
+   * `created >= published >= paymentStarted >= protected`, but **`delivered >=
+   * released` is not an invariant** — a dispute resolved for the seller reaches
+   * `COMPLETED` via `DISPUTED -> RELEASE_PROCESSING` without ever entering
+   * `CONFIRMATION_PENDING`. `funnel-shape.spec.ts` derives that from the
+   * transition function; do not "fix" the query to make the columns monotone,
+   * because clamping `released` would be the lie.
    */
   async getPlatformMetrics(from: Date, to: Date): Promise<PlatformAnalyticsResponse> {
     const rows = await this.prisma.$queryRaw<PlatformMetrics[]>(Prisma.sql`

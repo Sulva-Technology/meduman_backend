@@ -735,12 +735,21 @@ the platform is: a transaction created yesterday cannot have been delivered and
 released yet, so the late-funnel stages read near zero. Compare like-for-like
 windows, or use a long one, before drawing a conclusion — and say so in the UI.
 
-Stages only ever narrow (`created >= published >= paymentStarted >= protected >=
-delivered >= released`), so this inequality is safe to assert in a chart. It holds
-even though individual transactions move **backwards** through the lifecycle — an
-abandoned payment drops `PAYMENT_PENDING → LINK_ACTIVE`, a withdrawn dispute drops
-`DISPUTED → PAYMENT_PROTECTED` — because the counts read the immutable timeline
-rather than the current status, which is exactly why the funnel is trustworthy.
+**Do not assume the columns narrow all the way down.** `created >= published >=
+paymentStarted >= protected` **is** an invariant and is safe to assert. `delivered
+>= released` is **not**: after protection the lifecycle forks, and a dispute
+resolved for the seller goes `DISPUTED → RELEASE_PROCESSING → COMPLETED` without
+ever passing through `CONFIRMATION_PENDING`. A cohort containing such a dispute
+has `released > delivered`. That is a fact about the business, not a bug — both
+columns are exactly "did a timeline row with that state ever exist" — so render
+the rows honestly rather than clamping `released` to `delivered`, and don't wire
+a chart that assumes a clean funnel below `protected`.
+
+It holds even though individual transactions move **backwards** through the
+lifecycle — an abandoned payment drops `PAYMENT_PENDING → LINK_ACTIVE`, a
+withdrawn dispute drops `DISPUTED → PAYMENT_PROTECTED` — because the counts read
+the immutable timeline rather than the current status, which is exactly why the
+funnel is trustworthy.
 
 ---
 
