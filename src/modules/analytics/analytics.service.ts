@@ -45,35 +45,35 @@ export class AnalyticsService {
   async getPlatformMetrics(from: Date, to: Date): Promise<PlatformAnalyticsResponse> {
     const rows = await this.prisma.$queryRaw<PlatformMetrics[]>(Prisma.sql`
       WITH cohort AS (
-        SELECT id, origin, seller_id, buyer_id, amount, fee_amount
+        SELECT id, origin, "sellerId", "buyerId", amount, "feeAmount"
           FROM "transactions"
-         WHERE "created_at" >= ${from} AND "created_at" < ${to}
+         WHERE "createdAt" >= ${from} AND "createdAt" < ${to}
       ),
       staged AS (
         SELECT
           c.origin,
-          c.seller_id,
-          c.buyer_id,
+          c."sellerId",
+          c."buyerId",
           c.amount,
-          c.fee_amount,
+          c."feeAmount",
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.published}) AS published,
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.published}) AS published,
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.paymentStarted}) AS payment_started,
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.paymentStarted}) AS payment_started,
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.protectedState}) AS protected,
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.protectedState}) AS protected,
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.delivered}) AS delivered,
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.delivered}) AS delivered,
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.released}) AS released,
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.released}) AS released,
           EXISTS (SELECT 1 FROM "timeline_events" te
-                   WHERE te."transaction_id" = c.id AND te."new_state" = ${STAGE.disputed}) AS disputed
+                   WHERE te."transactionId" = c.id AND te."newState" = ${STAGE.disputed}) AS disputed
         FROM cohort c
       )
       SELECT
         s.origin::text                        AS "origin",
-        COUNT(DISTINCT s.seller_id)           AS "sellers",
-        COUNT(DISTINCT s.buyer_id)            AS "buyers",
+        COUNT(DISTINCT s."sellerId")          AS "sellers",
+        COUNT(DISTINCT s."buyerId")           AS "buyers",
         COUNT(*)                              AS "created",
         COUNT(*) FILTER (WHERE s.published)       AS "published",
         COUNT(*) FILTER (WHERE s.payment_started) AS "paymentStarted",
@@ -83,7 +83,7 @@ export class AnalyticsService {
         COUNT(*) FILTER (WHERE s.disputed)        AS "disputed",
         COALESCE(SUM(s.amount)     FILTER (WHERE s.protected), 0) AS "protectedVolumeKobo",
         COALESCE(SUM(s.amount)     FILTER (WHERE s.released), 0)  AS "releasedVolumeKobo",
-        COALESCE(SUM(s.fee_amount) FILTER (WHERE s.protected), 0) AS "feesKobo"
+        COALESCE(SUM(s."feeAmount") FILTER (WHERE s.protected), 0) AS "feesKobo"
       FROM staged s
       GROUP BY s.origin
     `);

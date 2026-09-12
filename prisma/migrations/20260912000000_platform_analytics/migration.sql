@@ -21,7 +21,7 @@ CREATE INDEX "timeline_events_transactionId_newState_idx" ON "timeline_events"("
 
 -- EaaS is unambiguous: the tenant column IS the record.
 UPDATE "transactions" SET "origin" = 'EAAS'
- WHERE "merchant_id" IS NOT NULL;
+ WHERE "merchantId" IS NOT NULL;
 
 -- Otherwise attribute to chat ONLY when the seller holds exactly one chat
 -- identity. Two identities means the origin is genuinely ambiguous, and a guess
@@ -31,7 +31,7 @@ UPDATE "transactions" SET "origin" = 'EAAS'
 -- distinct Postgres enum types, so the value must go through text.
 UPDATE "transactions" t SET "origin" = (
   SELECT ci."platform"::text::"TransactionOrigin"
-    FROM "chat_identities" ci WHERE ci."user_id" = t."seller_id"
+    FROM "chat_identities" ci WHERE ci."userId" = t."sellerId"
 )
- WHERE t."merchant_id" IS NULL
-   AND (SELECT COUNT(*) FROM "chat_identities" ci WHERE ci."user_id" = t."seller_id") = 1;
+ WHERE t."merchantId" IS NULL
+   AND (SELECT COUNT(*) FROM "chat_identities" ci WHERE ci."userId" = t."sellerId") = 1;
