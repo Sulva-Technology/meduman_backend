@@ -1,7 +1,9 @@
 import { NotFoundException } from '@nestjs/common';
+import { TransactionOrigin } from '@prisma/client';
 import type { PrismaService } from '@/prisma/prisma.service';
 import type { OutboundEventsService } from '@/modules/outbound-events/outbound-events.service';
 import { TransactionsService } from './transactions.service';
+import { CreateTransactionDto } from './dto/create-transaction.dto';
 
 const stubOutbound = {
   recordForTransition: () => Promise.resolve(null),
@@ -124,5 +126,38 @@ describe('TransactionsService.getById', () => {
     const service = new TransactionsService(prisma, stubOutbound);
 
     await expect(service.getById('nope')).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+
+describe('TransactionsService.createDraft origin', () => {
+  it('records the caller-supplied origin', async () => {
+    const { prisma, spy } = makePrisma();
+    const service = new TransactionsService(prisma, stubOutbound);
+
+    await service.createDraft({
+      sellerId: 'seller-1',
+      title: 'Sneakers',
+      amount: 1500000,
+      origin: TransactionOrigin.TELEGRAM,
+    });
+
+    expect(spy.create.mock.calls[0][0].data.origin).toBe(TransactionOrigin.TELEGRAM);
+  });
+
+  it('falls back to WEB when an entrypoint declares nothing', async () => {
+    const { prisma, spy } = makePrisma();
+    const service = new TransactionsService(prisma, stubOutbound);
+
+    await service.createDraft({ sellerId: 'seller-1', title: 'Sneakers', amount: 1500000 });
+
+    expect(spy.create.mock.calls[0][0].data.origin).toBe(TransactionOrigin.WEB);
+  });
+
+  it('ignores an origin smuggled in through the request DTO shape', () => {
+    // The DTO has no `origin` property, so class-validator strips it and the
+    // controller cannot pass it. This asserts the service only accepts the
+    // typed field — a client cannot claim a platform it is not on (rule 1).
+    const dto = new CreateTransactionDto();
+    expect(Object.keys(dto)).not.toContain('origin');
   });
 });

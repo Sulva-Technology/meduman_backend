@@ -9,6 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { TransactionOrigin } from '@prisma/client';
 import { Public } from '@/modules/auth/decorators/public.decorator';
 import { ApiKeyGuard, type MerchantContext } from './api-key.guard';
 import { CurrentMerchant } from './decorators/current-merchant.decorator';
@@ -48,6 +49,7 @@ export class V1TransactionsController {
       sellerId: dto.sellerId,
       title: dto.title,
       amount: dto.amount,
+      origin: TransactionOrigin.EAAS,
       ...(dto.description ? { description: dto.description } : {}),
       ...(dto.currency ? { currency: dto.currency } : {}),
       ...(dto.releaseRule ? { releaseRule: dto.releaseRule } : {}),

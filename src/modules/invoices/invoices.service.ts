@@ -5,7 +5,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ActorType, InvoiceStatus, type Invoice, type Prisma } from '@prisma/client';
+import {
+  ActorType,
+  InvoiceStatus,
+  TransactionOrigin,
+  type Invoice,
+  type Prisma,
+} from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
 import { TransactionsService } from '@/modules/transactions/transactions.service';
 import { NotificationsService } from '@/modules/notifications/notifications.service';
@@ -240,6 +246,9 @@ export class InvoicesService {
       title: invoice.number || `Invoice`,
       amount: invoice.total,
       currency: invoice.currency,
+      // Invoices are a web-only surface today. A future chat invoice path MUST
+      // pass its platform here instead — nothing else records it.
+      origin: TransactionOrigin.WEB,
     });
     await this.transactions.apply({
       transactionId: tx.id,

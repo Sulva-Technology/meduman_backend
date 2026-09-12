@@ -8,7 +8,13 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ActorType, type Dispute, type TimelineEvent, type Transaction } from '@prisma/client';
+import {
+  ActorType,
+  TransactionOrigin,
+  type Dispute,
+  type TimelineEvent,
+  type Transaction,
+} from '@prisma/client';
 import { CurrentUser } from '@/modules/auth/decorators/current-user.decorator';
 import type { SupabaseJwtClaims } from '@/modules/auth';
 import { QueueService } from '@/modules/queue/queue.service';
@@ -34,6 +40,7 @@ export class TransactionsController {
       sellerId: claims.sub,
       title: dto.title,
       amount: dto.amount,
+      origin: TransactionOrigin.WEB,
       ...(dto.description ? { description: dto.description } : {}),
       ...(dto.releaseRule ? { releaseRule: dto.releaseRule } : {}),
       ...(dto.feeModel ? { feeModel: dto.feeModel } : {}),

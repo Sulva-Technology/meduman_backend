@@ -10,6 +10,7 @@ import {
   type User,
 } from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
+import { toTransactionOrigin } from '@/modules/analytics/origin.mapper';
 import { TransactionsService } from '@/modules/transactions/transactions.service';
 import { TransitionRejectedError } from '@/modules/transactions/transition-rejected.error';
 import { PaymentsService } from '@/modules/payments/payments.service';
@@ -218,6 +219,8 @@ export class ChatDialogService {
       sellerId: user.id,
       title: draft.title,
       amount: draft.amountKobo,
+      // The platform the seller typed /sell on, not the buyer's.
+      origin: toTransactionOrigin(identity.platform),
       ...(description ? { description } : {}),
     });
     // Publish immediately so a buyer can pay the link.

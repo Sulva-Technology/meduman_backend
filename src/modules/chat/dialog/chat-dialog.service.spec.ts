@@ -1,4 +1,10 @@
-import { TransactionStatus, type ChatIdentity, type ChatSession, type User } from '@prisma/client';
+import {
+  TransactionOrigin,
+  TransactionStatus,
+  type ChatIdentity,
+  type ChatSession,
+  type User,
+} from '@prisma/client';
 import type { PrismaService } from '@/prisma/prisma.service';
 import type { TransactionsService } from '@/modules/transactions/transactions.service';
 import type { PaymentsService } from '@/modules/payments/payments.service';
@@ -163,7 +169,13 @@ describe('ChatDialogService — seller creates a transaction', () => {
     } as never);
 
     expect(createDraft).toHaveBeenCalledWith(
-      expect.objectContaining({ sellerId: 'user-1', title: 'Sneakers', amount: 500000 }),
+      expect.objectContaining({
+        sellerId: 'user-1',
+        title: 'Sneakers',
+        amount: 500000,
+        // The origin is the seller's platform, read from their identity.
+        origin: TransactionOrigin.TELEGRAM,
+      }),
     );
     // Published through the machine — never a direct status write.
     expect(apply).toHaveBeenCalledWith(
