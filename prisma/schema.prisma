@@ -73,6 +73,20 @@ enum TransactionStatus {
   EXPIRED // link/window lapsed with no payment
 }
 
+/// Where a transaction was created. Server-owned, written once by the creating
+/// entrypoint, never client-supplied and never updated — the same posture as
+/// TransactionStatus (rule 1). `X` exists for symmetry with ChatPlatform even
+/// though the X adapter is a stub; adding it now avoids a later migration.
+enum TransactionOrigin {
+  WEB
+  TELEGRAM
+  WHATSAPP
+  INSTAGRAM
+  MESSENGER
+  X
+  EAAS
+}
+
 /// How a transaction becomes eligible for automated release.
 enum ReleaseRule {
   BUYER_CONFIRMATION // buyer must confirm (OTP or in-app)
@@ -392,6 +406,10 @@ model Transaction {
   merchantId String?   @db.Uuid
   merchant   Merchant? @relation(fields: [merchantId], references: [id])
 
+  /// Where this transaction was created. Server-owned; written once at creation
+  /// from a literal by the entrypoint, never from a request body, never updated.
+  origin TransactionOrigin @default(WEB)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -410,6 +428,7 @@ model Transaction {
   @@index([createdAt])
   @@index([expiresAt])
   @@index([merchantId])
+  @@index([origin, createdAt])
   @@map("transactions")
 }
 
@@ -694,6 +713,9 @@ model TimelineEvent {
 
   @@index([transactionId])
   @@index([createdAt])
+  /// Serves the per-stage EXISTS probe in the analytics funnel — without it each
+  /// probe is a scan of the transaction's events.
+  @@index([transactionId, newState])
   @@map("timeline_events")
 }
 
