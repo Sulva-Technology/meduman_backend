@@ -75,8 +75,18 @@ enum TransactionOrigin {
 
 Run:
 ```bash
-npm run prisma:generate && mkdir -p prisma/migrations/20260912000000_platform_analytics && npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script > prisma/migrations/20260912000000_platform_analytics/migration.sql
+npm run prisma:generate
+mkdir -p prisma/migrations/20260912000000_platform_analytics
+git show HEAD:prisma/schema.prisma > /tmp/schema-base.prisma
+npx prisma migrate diff --from-schema-datamodel /tmp/schema-base.prisma --to-schema-datamodel prisma/schema.prisma --script > prisma/migrations/20260912000000_platform_analytics/migration.sql
 ```
+
+**Do NOT use `--from-schema-datasource`.** It diffs from the LIVE database. The
+local docker Postgres lags the schema (it predates `waitlist_entries`, the chat
+table id defaults, and the whole chat-account-linking migration), so a datasource
+diff emits `DROP`/`ALTER COLUMN` against already-shipped tables. Diffing the
+committed schema (`git show HEAD:…`) against the working tree is fully offline and
+produces only the new statements.
 
 Expected: the file contains `CREATE TYPE "TransactionOrigin"`, `ALTER TABLE "transactions" ADD COLUMN "origin" "TransactionOrigin" NOT NULL DEFAULT 'WEB'`, and two `CREATE INDEX`. **Confirm there is no `DROP` and no `ALTER COLUMN` on an existing column** — this migration is purely additive. If it is not, stop and report.
 
@@ -416,6 +426,7 @@ git commit -m "feat(analytics): record transaction origin at every write site"
 - Create: `src/modules/analytics/analytics.service.ts`
 - Create: `src/modules/analytics/analytics.service.spec.ts`
 - Create: `src/modules/analytics/analytics.module.ts`
+- Create: `src/modules/transactions/timeline-parity.spec.ts`
 
 **Interfaces:**
 - Consumes: `ALL_ORIGINS` (Task 2); `PrismaService`.
@@ -602,12 +613,15 @@ function kobo(value: bigint): string {
 /**
  * Fraction to 4dp, not a percent. 0 when nothing was protected — a rate over an
  * empty denominator is undefined, and 0 is the honest rendering of "no data".
+ *
+ * One integer division, in units of 1e-4, then scale once. Dividing twice
+ * (`/ 100n` then `/ 100`) truncates to 2dp and silently understates the rate.
  */
 function rate(disputed: bigint, protectedCount: bigint): number {
   if (protectedCount === 0n) {
     return 0;
   }
-  return Number(((disputed * 10_000n) / protectedCount) / 100n) / 100;
+  return Number((disputed * 10_000n) / protectedCount) / 10_000;
 }
 
 function toResponse(row: PlatformMetrics): PlatformMetricsResponse {
@@ -709,7 +723,140 @@ export function toPlatformAnalyticsResponse(
 Run: `npx jest src/modules/analytics/analytics.mapper.spec.ts`
 Expected: PASS, 6 tests.
 
-- [ ] **Step 6: Write the failing service test** — `src/modules/analytics/analytics.service.spec.ts`
+- [ ] **Step 6: Write the timeline-parity spec** — `src/modules/transactions/timeline-parity.spec.ts`
+
+The funnel reads `TimelineEvent` on the assumption that **every transition the
+machine permits produces a timeline row**. The spec calls that assumption
+load-bearing and requires its own test; this is it. It is the guard against a
+future early-return in `apply` silently starving the funnel.
+
+```ts
+import { ActorType, TransactionStatus } from '@prisma/client';
+import type { PrismaService } from '@/prisma/prisma.service';
+import type { OutboundEventsService } from '@/modules/outbound-events/outbound-events.service';
+import { TransactionsService } from './transactions.service';
+import { TransitionRejectedError } from './transition-rejected.error';
+import {
+  transition,
+  type TransactionContext,
+  type TransactionEvent,
+  type TransactionEventType,
+} from './state-machine';
+
+const stubOutbound = {
+  recordForTransition: () => Promise.resolve(null),
+  dispatch: () => Promise.resolve(),
+} as unknown as OutboundEventsService;
+
+/**
+ * One concrete event per `TransactionEvent['type']`. `satisfies` plus the
+ * totality assertion below fail to COMPILE if the union gains a member this list
+ * misses — so the matrix cannot silently go stale.
+ */
+const ALL_EVENTS = [
+  { type: 'SELLER_PUBLISH' },
+  { type: 'CANCEL' },
+  { type: 'BUYER_INITIATE_CHECKOUT' },
+  { type: 'EXPIRE' },
+  { type: 'PAYMENT_VERIFIED', source: 'WEBHOOK' },
+  { type: 'PAYMENT_ABANDONED' },
+  { type: 'SELLER_START_DELIVERY' },
+  { type: 'RAISE_DISPUTE' },
+  { type: 'REFUND' },
+  { type: 'SELLER_MARK_DELIVERED' },
+  { type: 'BUYER_CONFIRM' },
+  { type: 'AUTO_CONFIRM' },
+  { type: 'RESOLVE_DISPUTE_FOR_SELLER' },
+  { type: 'RESOLVE_DISPUTE_FOR_BUYER' },
+  { type: 'WITHDRAW_DISPUTE' },
+  { type: 'PAYOUT_SUCCEEDED' },
+  { type: 'PAYOUT_RETRY' },
+  { type: 'ADMIN_INTERVENTION' },
+] as const satisfies readonly TransactionEvent[];
+
+type CoveredEventType = (typeof ALL_EVENTS)[number]['type'];
+/** Compile-time totality proof. `never` only if the union is fully covered. */
+const EVERY_EVENT_TYPE_IS_COVERED: Exclude<TransactionEventType, CoveredEventType> extends never
+  ? true
+  : never = true;
+
+/** A context that permits every guarded transition, so the matrix is about the
+ *  graph rather than about the guards. */
+const PERMISSIVE: TransactionContext = {
+  releaseRule: 'AUTO_AFTER_WINDOW',
+  hasOpenDispute: false,
+  autoConfirmWindowElapsed: true,
+};
+
+describe('timeline parity', () => {
+  it('covers every event type in the union', () => {
+    expect(EVERY_EVENT_TYPE_IS_COVERED).toBe(true);
+  });
+
+  it('writes exactly one timeline row per permitted transition, and none per rejection', async () => {
+    const actor = { id: 'user-1', type: ActorType.USER, role: 'SELLER' };
+    const permitted: string[] = [];
+    const rejected: string[] = [];
+
+    for (const from of Object.values(TransactionStatus)) {
+      for (const event of ALL_EVENTS) {
+        const row = {
+          id: 'tx-1',
+          status: from,
+          releaseRule: 'AUTO_AFTER_WINDOW',
+          disputes: [],
+        };
+        const txClient = {
+          transaction: {
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            findUniqueOrThrow: jest.fn().mockResolvedValue({ ...row }),
+          },
+          timelineEvent: { create: jest.fn().mockResolvedValue({}) },
+          auditLog: { create: jest.fn().mockResolvedValue({}) },
+        };
+        const prisma = {
+          transaction: { findUnique: jest.fn().mockResolvedValue(row) },
+          $transaction: jest.fn(
+            async (cb: (db: typeof txClient) => Promise<unknown>) => cb(txClient),
+          ),
+        } as unknown as PrismaService;
+        const service = new TransactionsService(prisma, stubOutbound);
+        const key = `${from} + ${event.type}`;
+        const call = { transactionId: 'tx-1', event, actor };
+
+        const expected = transition(from, event, PERMISSIVE);
+        if (expected.ok) {
+          await service.apply(call);
+          // Object equality so a failure names the offending pair.
+          expect({ key, written: txClient.timelineEvent.create.mock.calls.length }).toEqual({
+            key,
+            written: 1,
+          });
+          permitted.push(key);
+        } else {
+          await expect(service.apply(call)).rejects.toBeInstanceOf(TransitionRejectedError);
+          expect({ key, written: txClient.timelineEvent.create.mock.calls.length }).toEqual({
+            key,
+            written: 0,
+          });
+          rejected.push(key);
+        }
+      }
+    }
+
+    // Guards against a vacuous pass: both outcomes must actually occur.
+    expect(permitted.length).toBeGreaterThan(0);
+    expect(rejected.length).toBeGreaterThan(0);
+  });
+});
+```
+
+- [ ] **Step 7: Run the parity spec**
+
+Run: `npx jest src/modules/transactions/timeline-parity.spec.ts`
+Expected: PASS, 2 tests (216 status × event pairs exercised).
+
+- [ ] **Step 8: Write the failing service test** — `src/modules/analytics/analytics.service.spec.ts`
 
 ```ts
 import { Test } from '@nestjs/testing';
@@ -776,13 +923,16 @@ describe('AnalyticsService.getPlatformMetrics', () => {
     const from = new Date('2026-09-01T00:00:00Z');
     const to = new Date('2026-09-08T00:00:00Z');
     await service.getPlatformMetrics(from, to);
-    const values = prisma.$queryRaw.mock.calls[0].slice(1);
-    expect(values).toEqual([from, to]);
+    // `$queryRaw` is called with ONE argument — the `Sql` object built by
+    // `Prisma.sql` — not with (strings, ...values). The window is the first two
+    // interpolations; the stage constants follow.
+    const sql = prisma.$queryRaw.mock.calls[0][0] as { values: unknown[] };
+    expect(sql.values.slice(0, 2)).toEqual([from, to]);
   });
 });
 ```
 
-- [ ] **Step 7: Write the service** — `src/modules/analytics/analytics.service.ts`
+- [ ] **Step 9: Write the service** — `src/modules/analytics/analytics.service.ts`
 
 ```ts
 import { Injectable } from '@nestjs/common';
@@ -880,7 +1030,7 @@ Notes for the implementer:
 - The `COUNT(*) FILTER` counts are never NULL, but the `SUM` ones are NULL over zero matching rows — hence the `COALESCE`, which the spec requires.
 - The cohort scan is served by the existing `@@index([createdAt])`. The new `(origin, createdAt)` index serves a future per-origin filter; this query groups by origin rather than filtering on it.
 
-- [ ] **Step 8: Write the module** — `src/modules/analytics/analytics.module.ts`
+- [ ] **Step 10: Write the module** — `src/modules/analytics/analytics.module.ts`
 
 ```ts
 import { Module } from '@nestjs/common';
@@ -897,15 +1047,15 @@ export class AnalyticsModule {}
 
 Check how `PrismaModule` is registered — if it is `@Global()`, no import is needed here; otherwise add `imports: [PrismaModule]`. Match `admin.module.ts`'s posture.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [ ] **Step 11: Run the tests to verify they pass**
 
-Run: `npx jest src/modules/analytics`
-Expected: PASS, 15 tests.
+Run: `npx jest src/modules/analytics src/modules/transactions`
+Expected: PASS — mapper 6, service 4, parity 2, plus every existing transactions suite unchanged.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add src/modules/analytics/
+git add src/modules/analytics/ src/modules/transactions/timeline-parity.spec.ts
 git commit -m "feat(analytics): per-platform funnel and money metrics"
 ```
 
@@ -918,7 +1068,7 @@ git commit -m "feat(analytics): per-platform funnel and money metrics"
 - Modify: `src/modules/admin/admin.controller.ts`
 - Modify: `src/modules/admin/admin.module.ts`
 - Modify: `src/config/env.validation.ts`
-- Modify: `.env.example`, `.env.test`
+- Modify: `.env.example`
 - Create: `src/modules/analytics/dto/platform-analytics.dto.spec.ts`
 
 **Interfaces:**
@@ -1116,7 +1266,7 @@ git commit -m "docs(analytics): origin column, platform endpoint, and cohort cav
 
 ## Self-Review
 
-**Spec coverage.** Data model → 1; write sites → 3 (all four entrypoints, plus the "never read from a request body" assertion); backfill → 1 Step 5; funnel definition → 4 Steps 7-8; metrics table → 4; BigInt trap → 4 Step 1 (a unit case that JSON-stringifies a `bigint` above 2^53) and 6 case 5; admin surface → 5; cohort semantics and the caveat → 4 Step 7's doc comment and 7 Step 2; testing list → the unit specs plus 6; ordering → the header's `Depends on` line.
+**Spec coverage.** Data model → 1; write sites → 3 (all four entrypoints, plus the "never read from a request body" assertion); backfill → 1 Step 5; funnel definition → 4 Steps 9-10; the timeline-parity test the spec requires → 4 Step 6; metrics table → 4; BigInt trap → 4 Step 1 (a unit case that JSON-stringifies a `bigint` above 2^53) and 6 case 5; admin surface → 5; cohort semantics and the caveat → 4 Step 9's doc comment and 7 Step 2; testing list → the unit specs plus 6; ordering → the header's `Depends on` line.
 
 **Placeholder scan.** No TBD/TODO. Two places ask the implementer to match existing code rather than pasting it: Task 3 Step 6 (the chat dialog spec's mocking style) and Task 6 Step 1 (the e2e harness). Both name the exact file to read first and say what to assert — the harness is genuinely the reader's to match, and inventing a second one would be worse than reading the first.
 
