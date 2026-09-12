@@ -567,18 +567,32 @@ Migrations use `DIRECT_URL`. Runtime uses `DATABASE_URL`. Don't swap them.
   via `migrate diff --from-schema-datamodel`: pure `CREATE TYPE` / `ADD COLUMN` /
   `CREATE INDEX`, 0 `DROP`, 0 `ALTER COLUMN`). Tests: origin mapper, analytics
   mapper (incl. a `JSON.stringify` of a `bigint` above 2^53), service mapping +
-  window passthrough, the timeline-parity matrix (216 pairs), the DTO, the
-  controller's range checks, and
-  [`test/platform-analytics.e2e-spec.ts`](test/platform-analytics.e2e-spec.ts) (7
+  window passthrough, the timeline-parity matrix (216 pairs), the funnel-shape
+  spec, the DTO, the controller's range checks, and
+  [`test/platform-analytics.e2e-spec.ts`](test/platform-analytics.e2e-spec.ts) (8
   cases — **authored, never run**; includes the abandoned-payment and
-  withdrawn-dispute cases that prove the timeline-reading design, and a case
-  asserting `origin` survives a chat→web account link untouched).
+  withdrawn-dispute cases that prove the timeline-reading design, a case asserting
+  `origin` survives a chat→web account link untouched, and the
+  dispute-resolved-for-seller case below).
+  **The stage counts are cumulative only up to `protected`.** `created >=
+  published >= paymentStarted >= protected` is an invariant; **`delivered >=
+  released` is NOT** — after protection the lifecycle forks, and a dispute resolved
+  for the seller reaches `COMPLETED` via `DISPUTED → RELEASE_PROCESSING` without
+  ever entering `CONFIRMATION_PENDING`, so a cohort can genuinely have more
+  released than delivered transactions. Both columns remain honest (each is
+  exactly "a timeline row with this `newState` exists") — the columns were never
+  wrong, the invariant drawn from them was.
+  `src/modules/analytics/funnel-shape.spec.ts` derives that fork from
+  `transition()` itself so it cannot rot back; **do not "fix" the query to make
+  the columns monotone**, because clamping `released` would be the lie. This was
+  the CRITICAL defect the final review caught, and the spec and plan were corrected
+  alongside the code.
 
 **Status: full spine + chat bot gateway (Telegram + Meta adapters, X stub, DVA
 payments, chat photo/document evidence) + Phase 1 invoicing + EaaS Slice 1
 (merchant tenancy + API-key `/v1`) done and PROVEN
 against a real Postgres +
-Redis — 69 unit suites / 508 tests, lint + build clean. Chat account linking and
+Redis — 70 unit suites / 514 tests, lint + build clean. Chat account linking and
 platform analytics are each **unit-proven only**: their migrations
 `20260911000000_chat_account_linking` and `20260912000000_platform_analytics` are
 **UNAPPLIED** and their e2e suites have **never executed** (the docker daemon was
