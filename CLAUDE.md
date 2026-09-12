@@ -518,23 +518,83 @@ Migrations use `DIRECT_URL`. Runtime uses `DATABASE_URL`. Don't swap them.
   (52 linking tests) + [`test/chat-account-linking.e2e-spec.ts`](test/chat-account-linking.e2e-spec.ts)
   (8 money-safety cases — **authored, never run**, no e2e has executed here).
 
+- **analytics/ (platform metrics) — done (code); e2e authored but NOT executed.**
+  Answers "which platform actually does what" — a per-`origin` funnel + money
+  table over a date range (`GET /admin/analytics/platforms`, `@Roles('ADMIN')`).
+  Design: [`docs/superpowers/specs/2026-09-11-platform-analytics-design.md`](docs/superpowers/specs/2026-09-11-platform-analytics-design.md).
+  **`Transaction.origin`** (`TransactionOrigin` enum — `WEB` / `TELEGRAM` /
+  `WHATSAPP` / `INSTAGRAM` / `MESSENGER` / `X` / `EAAS`) is **server-owned**: never
+  a DTO field, never read from a request body, never updated. Each entrypoint
+  passes a literal — `transactions.controller.ts` and `invoices.service.ts` pass
+  `WEB`, `v1-transactions.controller.ts` passes `EAAS`, and `chat-dialog.service.ts`
+  passes `toTransactionOrigin(identity.platform)` (the **seller's** platform, not
+  the buyer's). It is a record of the past: linking a chat account to a web account
+  re-parents the row's `sellerId` but leaves `origin` alone. Column default `WEB`
+  is a backstop, not the mechanism. `ALL_ORIGINS` (Task 2's mapper) is the single
+  vocabulary the zero-fill and the totals row both derive from, so the response is
+  **always seven rows + `totals`** whatever the data.
+  **The funnel reads `TimelineEvent`, it does NOT rank statuses.** A status-rank
+  funnel is provably wrong on this lifecycle: `PAYMENT_PENDING → LINK_ACTIVE`
+  (`PAYMENT_ABANDONED`), `DISPUTED → PAYMENT_PROTECTED` (`WITHDRAW_DISPUTE`) and
+  `RELEASE_PROCESSING → RELEASE_PROCESSING` (`PAYOUT_RETRY`) all move a
+  transaction's final status *backwards* through the funnel. The
+  **abandoned-payment case is the proof**: a buyer who opens checkout and walks
+  away leaves the transaction at `LINK_ACTIVE`, which a status-rank funnel reads as
+  "never started payment" and loses the attempt entirely. So the service's single
+  `$queryRaw` stages each cohort transaction with an `EXISTS` probe against
+  `timeline_events.new_state` (backed by the new `(transaction_id, new_state)`
+  index) and counts `FILTER (WHERE …)` per stage. The invariant that makes this
+  sound — every transition the machine permits writes exactly one timeline row, and
+  every rejection writes none — has its own test,
+  `src/modules/transactions/timeline-parity.spec.ts`.
+  **Cohort semantics, and the caveat the frontend must print:** rows are cohorts by
+  `createdAt` in `[from, to)`. A transaction counts in every stage it has *ever*
+  reached, not only its current one. A short recent window therefore looks **worse**
+  than the platform is — a transaction created yesterday cannot have been delivered
+  and released yet, so late-funnel stages read near zero. Compare like-for-like
+  windows (or long ones) before drawing a conclusion.
+  **Money leaves the service as decimal strings, never `BigInt`.** Postgres `SUM`
+  returns `bigint`; Prisma's `$queryRaw` yields a JS `BigInt`, and
+  `JSON.stringify` **throws** `TypeError: Do not know how to serialize a BigInt`.
+  `analytics.mapper.ts` converts every kobo value to a string at the boundary,
+  `COALESCE`s a zero-row `SUM` to `0`, and re-derives `totals.disputeRate` from the
+  summed counts rather than averaging per-origin rates (averaging would weight one
+  protected transaction the same as ten thousand). `disputeRate` is a **fraction**,
+  not a percentage. Window width is capped by `ANALYTICS_MAX_RANGE_DAYS`; ordering
+  and width are cross-field checks in the controller. Read-only, so it writes **no
+  audit row** (rule 6 covers state changes and admin *actions*, not reads). Additive
+  migration `20260912000000_platform_analytics` (**UNAPPLIED** — authored offline
+  via `migrate diff --from-schema-datamodel`: pure `CREATE TYPE` / `ADD COLUMN` /
+  `CREATE INDEX`, 0 `DROP`, 0 `ALTER COLUMN`). Tests: origin mapper, analytics
+  mapper (incl. a `JSON.stringify` of a `bigint` above 2^53), service mapping +
+  window passthrough, the timeline-parity matrix (216 pairs), the DTO, the
+  controller's range checks, and
+  [`test/platform-analytics.e2e-spec.ts`](test/platform-analytics.e2e-spec.ts) (7
+  cases — **authored, never run**; includes the abandoned-payment and
+  withdrawn-dispute cases that prove the timeline-reading design, and a case
+  asserting `origin` survives a chat→web account link untouched).
+
 **Status: full spine + chat bot gateway (Telegram + Meta adapters, X stub, DVA
 payments, chat photo/document evidence) + Phase 1 invoicing + EaaS Slice 1
 (merchant tenancy + API-key `/v1`) done and PROVEN
 against a real Postgres +
-Redis — 63 unit suites / 482 tests, lint + build clean. Chat account linking is
-**unit-proven only**: its migration `20260911000000_chat_account_linking` is
-**UNAPPLIED** and its e2e suite has **never executed** (the docker daemon was down
-throughout). The eight earlier migrations apply clean to
-an empty DB; the app boots, `/health` and `/health/ready`
-(`{"db":true,"redis":true}`) return 200, and an unauthenticated protected route
-still 401s. (`ioredis` pinned to `5.10.1` to match bullmq's exact pin.) New env
-since scaffold: `OTP_HASH_SECRET`, `OTP_MAX_ATTEMPTS`, `WEBHOOK_MAX_AGE_SECONDS`,
-`SENTRY_DSN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
-`CHAT_IDENTITY_EMAIL_DOMAIN`, `CHAT_SESSION_TTL_SECONDS`, the `META_*` /
-`WHATSAPP_*` / `MESSENGER_*` / `INSTAGRAM_*` set, `X_ADAPTER_ENABLED`,
-`EAAS_API_KEY_SECRET`, and `CHAT_LINK_HASH_SECRET` (+ `CHAT_LINK_CODE_LENGTH`,
-`CHAT_LINK_CODE_TTL_SECONDS`, `CHAT_LINK_MAX_ATTEMPTS`).
+Redis — 69 unit suites / 508 tests, lint + build clean. Chat account linking and
+platform analytics are each **unit-proven only**: their migrations
+`20260911000000_chat_account_linking` and `20260912000000_platform_analytics` are
+**UNAPPLIED** and their e2e suites have **never executed** (the docker daemon was
+down throughout). Eleven migrations exist; the newest three —
+`20260801000000_notification_read_at`, `20260911000000_chat_account_linking` and
+`20260912000000_platform_analytics` — were all authored offline and are
+**UNAPPLIED**. Once they are applied, the app boots, `/health` and
+`/health/ready` (`{"db":true,"redis":true}`) return 200, and an unauthenticated
+protected route still 401s. (`ioredis` pinned to `5.10.1` to match bullmq's exact
+pin.) New env since scaffold: `OTP_HASH_SECRET`, `OTP_MAX_ATTEMPTS`,
+`WEBHOOK_MAX_AGE_SECONDS`, `SENTRY_DSN`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_WEBHOOK_SECRET`, `CHAT_IDENTITY_EMAIL_DOMAIN`,
+`CHAT_SESSION_TTL_SECONDS`, the `META_*` / `WHATSAPP_*` / `MESSENGER_*` /
+`INSTAGRAM_*` set, `X_ADAPTER_ENABLED`, `EAAS_API_KEY_SECRET`,
+`CHAT_LINK_HASH_SECRET` (+ `CHAT_LINK_CODE_LENGTH`, `CHAT_LINK_CODE_TTL_SECONDS`,
+`CHAT_LINK_MAX_ATTEMPTS`), and `ANALYTICS_MAX_RANGE_DAYS` (366).
 
 **Known-red on `npm test` (pre-existing, NOT from account linking):** 4 tests in
 `src/modules/queue/queue.service.spec.ts` (3) and

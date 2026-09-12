@@ -162,6 +162,27 @@ npm run db:up && npm run db:migrate:test && npm run test:e2e
       audited admin decision, not a silent one — confirm the operations runbook
       says so.
 
+- [x] **Platform analytics is `@Roles('ADMIN')` and read-only.** `GET
+      /admin/analytics/platforms` exposes aggregate counts and money across all
+      platforms, so it inherits the class-level ADMIN gate on `AdminController`. It
+      writes **no** audit row: rule 6 covers every state **transition** and every
+      admin **action**, and this is a read that changes nothing — auditing reads
+      would bury the transitions that matter in a table of page loads. Revisit if a
+      compliance requirement ever asks for read-audit on admin reporting.
+- [x] **`Transaction.origin` is server-owned (rule 1).** It is not a field on any
+      create DTO, so with the global `ValidationPipe({ forbidNonWhitelisted: true })`
+      a client that sends `origin` gets a **400** rather than a silently-stripped
+      field — the value never reaches the service. Each entrypoint passes a literal
+      (`WEB` from the web controller and invoices, `EAAS` from `/v1`, the seller's
+      platform from the chat dialog), it is never updated, and it intentionally
+      survives an account merge: it records where a transaction happened, not who
+      ended up owning it.
+- [ ] **`ANALYTICS_MAX_RANGE_DAYS`** (default **366**) bounds the width of an
+      analytics window, which in turn bounds the scan: the query stages a cohort of
+      transactions and probes each one's timeline, so an unbounded window is a scan
+      whose cost the caller chooses. Defaulted, not secret — no Render action needed
+      unless you want a tighter cap than a year.
+
 ## 3. Observability & ops
 
 - [x] **Structured JSON logging** — `nestjs-pino` wired as the app logger in
@@ -188,6 +209,16 @@ npm run db:up && npm run db:migrate:test && npm run test:e2e
       using `DIRECT_URL`, with runtime on pooled `DATABASE_URL` (don't swap them).
       Still unproven against Supabase + pgbouncer.
 - [ ] Seed (`prisma/seed.ts`) is dev-only — ensure it never runs against prod.
+- [ ] **Three migrations are UNAPPLIED and have never run anywhere** —
+      `20260801000000_notification_read_at`, `20260911000000_chat_account_linking`
+      and `20260912000000_platform_analytics`. All three were authored **offline**
+      (`prisma migrate diff --from-schema-datamodel <base> --to-schema-datamodel
+      prisma/schema.prisma`) because the docker daemon was down, and each was
+      inspected for destructive DDL before commit (the analytics one is pure
+      `CREATE TYPE` / `ADD COLUMN` / `CREATE INDEX`). **Apply them against a real
+      Postgres before trusting them** — `npm run db:up && npm run
+      db:migrate:test` locally first. The e2e suites for the last two have also
+      never executed for the same reason.
 - [ ] Backups / PITR confirmed on the Supabase project; document restore steps.
 - [ ] Index review for hot queries (status scans, `releaseAfter` cron scan,
       idempotency-key lookups).

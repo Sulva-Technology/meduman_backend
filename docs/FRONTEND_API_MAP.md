@@ -175,6 +175,7 @@ is in-app. Both call `apply(BUYER_CONFIRM)` server-side then enqueue release.
 | `/admin/disputes` | Dispute queue | 🟥 `GET /admin/disputes` |
 | `/admin/disputes/:id` | Resolve for seller (release) / buyer (refund) | ✅ `POST /disputes/:id/resolve` |
 | `/admin/link-requests` | Parked chat↔web merges needing a ruling | ✅ `GET /admin/chat/link-requests` + `POST …/:id/resolve` (Part B §11) |
+| `/admin/analytics` | Per-platform funnel + money table, date-range picker | ✅ `GET /admin/analytics/platforms` (Part B §12) |
 
 ---
 
@@ -676,6 +677,70 @@ Admin routes (`@Roles('ADMIN')`, rule 6 — every action is audited):
 The user-facing outcome is deliberately vague: a wrong, expired, consumed or
 attempt-capped code all produce the same "that code didn't work" reply, so the
 chat is not an oracle for guessing codes.
+
+---
+
+## §12 — `GET /admin/analytics/platforms` 🔒 (`@Roles('ADMIN')`)
+
+Built and wired. The "which platform does what" table: a per-`origin` funnel and
+money view over a date range, for the `/admin/analytics` page. Read-only.
+
+**Query:** `from` and `to`, both **required**, both ISO-8601
+(`@IsISO8601`). The window is a **half-open interval** — `createdAt >= from AND
+createdAt < to` — so `to` is **exclusive**; a transaction created exactly at `to`
+is not in the window. `from >= to` is a 400, and a range wider than
+`ANALYTICS_MAX_RANGE_DAYS` (default 366) is a 400. A missing bound is a 400, never
+a silent default.
+
+**Response:**
+
+```jsonc
+{
+  "from": "2026-09-01T00:00:00.000Z",   // echo of the window, resolved
+  "to":   "2026-10-01T00:00:00.000Z",
+  "platforms": [ /* always exactly 7 rows, one per origin, plus see below */ ],
+  "totals": { "origin": "ALL", /* …same fields… */ }
+}
+```
+
+Each row — and `totals` — carries:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `origin` | `'WEB' \| 'TELEGRAM' \| 'WHATSAPP' \| 'INSTAGRAM' \| 'MESSENGER' \| 'X' \| 'EAAS'` | `totals.origin` is `'ALL'` |
+| `sellers` / `buyers` | number | distinct counterparties in the cohort |
+| `created` | number | cohort size |
+| `published` | number | ever reached `LINK_ACTIVE` |
+| `paymentStarted` | number | ever reached `PAYMENT_PENDING` |
+| `protected` | number | ever reached `PAYMENT_PROTECTED` |
+| `delivered` | number | ever reached `CONFIRMATION_PENDING` |
+| `released` | number | ever reached `RELEASED` |
+| `disputed` | number | ever had a dispute raised |
+| `disputeRate` | number | **a fraction, not a percent** — `0.021` means 2.10%. `0` when nothing was protected |
+| `protectedVolumeKobo` | **string** | decimal string of integer kobo |
+| `releasedVolumeKobo` | **string** | decimal string of integer kobo |
+| `feesKobo` | **string** | decimal string of integer kobo |
+
+**Render, don't recompute.** `platforms` is **always seven rows** — one per
+origin, zero-filled — so an empty platform is a real `0` row rather than a missing
+one; never index it positionally, match on `origin`. Money arrives as **decimal
+strings** (a JSON number cannot hold the kobo range Postgres `SUM` returns), so
+parse with your decimal helper — not `Number()` — before formatting ₦. `totals` is
+the sum of the per-origin rows, so don't add them up client-side.
+
+**Print the cohort caveat next to a short-window view.** Rows are cohorts by
+creation date, and a transaction counts in every stage it has **ever** reached,
+not only its current one. That means a short **recent** window looks worse than
+the platform is: a transaction created yesterday cannot have been delivered and
+released yet, so the late-funnel stages read near zero. Compare like-for-like
+windows, or use a long one, before drawing a conclusion — and say so in the UI.
+
+Stages only ever narrow (`created >= published >= paymentStarted >= protected >=
+delivered >= released`), so this inequality is safe to assert in a chart. It holds
+even though individual transactions move **backwards** through the lifecycle — an
+abandoned payment drops `PAYMENT_PENDING → LINK_ACTIVE`, a withdrawn dispute drops
+`DISPUTED → PAYMENT_PROTECTED` — because the counts read the immutable timeline
+rather than the current status, which is exactly why the funnel is trustworthy.
 
 ---
 
