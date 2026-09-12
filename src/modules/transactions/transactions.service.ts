@@ -1,17 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { Injectable, NotFoundException } from '@nestjs/common';
-import type {
-  ActorType,
-  Dispute,
-  DisputeStatus,
-  FeeModel,
-  Payout,
-  ReleaseRule,
-  TimelineEvent,
-  Transaction,
-  TransactionStatus,
-  TrustLevel,
-  UserRole,
+import {
+  TransactionOrigin,
+  type ActorType,
+  type Dispute,
+  type DisputeStatus,
+  type FeeModel,
+  type Payout,
+  type ReleaseRule,
+  type TimelineEvent,
+  type Transaction,
+  type TransactionStatus,
+  type TrustLevel,
+  type UserRole,
 } from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
 import { OutboundEventsService } from '@/modules/outbound-events/outbound-events.service';
@@ -60,6 +61,13 @@ export interface CreateDraftInput {
   feeAmount?: number;
   expectedDeliveryDate?: Date;
   merchantId?: string;
+  /**
+   * Where this transaction is created. Server-owned: each entrypoint passes a
+   * literal (WEB for the web controllers, EAAS for `/v1`, the chat platform for
+   * the bot) — never a value from a request body. Defaults to WEB, which is the
+   * column default and the backstop, not the mechanism.
+   */
+  origin?: TransactionOrigin;
 }
 
 /** Query options for a role-scoped transaction list (cursor pagination). */
@@ -157,6 +165,7 @@ export class TransactionsService {
         amount: input.amount,
         publicLinkId: randomUUID().replace(/-/g, ''),
         status: 'DRAFT',
+        origin: input.origin ?? TransactionOrigin.WEB,
         ...(input.description ? { description: input.description } : {}),
         ...(input.currency ? { currency: input.currency } : {}),
         ...(input.releaseRule ? { releaseRule: input.releaseRule } : {}),

@@ -127,6 +127,61 @@ npm run db:up && npm run db:migrate:test && npm run test:e2e
       is static (literal-IP); DNS-rebind hardening (resolve-and-pin at send) +
       blocking 0.0.0.0 / IPv4-mapped IPv6 are follow-ups before external merchants
       point live URLs at us.** Both must be set in Render (`sync: false`).
+- [ ] **New env var `CHAT_LINK_HASH_SECRET`** (zod-required, min 32 chars) — keys
+      the HMAC-SHA256 hash-at-rest of every chat↔web link code, alongside
+      `CHAT_LINK_CODE_LENGTH` (8), `CHAT_LINK_CODE_TTL_SECONDS` (600) and
+      `CHAT_LINK_MAX_ATTEMPTS` (5). Set in Render (`sync: false`). Like
+      `OTP_HASH_SECRET`, **rotating it invalidates every live code** (in-flight
+      only — codes expire in 10 minutes, so this is a non-event rather than a
+      re-issue exercise).
+- [x] **Chat account-linking hardening** — the link code follows the OTP pattern
+      exactly: keyed HMAC hash-at-rest (the plaintext is returned once to the
+      authenticated web caller and never persisted, logged or audited), single-use,
+      TTL'd, attempt-capped, constant-time compared, and **generic to the client**
+      (a wrong, expired, consumed or attempt-capped code are indistinguishable, so
+      the bot is not an oracle for guessing codes; the precise reason goes to the
+      log and audit row only). The consume route mints nothing and moves nothing
+      until the code is verified. `GET /admin/chat/link-requests` never returns
+      `codeHash`.
+- [ ] **Account-merge retention — the absorbed account is TOMBSTONED, never
+      hard-deleted.** A chat-born account that is merged into a web account gets
+      `User.status = DEACTIVATED` + `mergedIntoUserId` + `mergedAt`; the row stays
+      so the historical record survives (legal retention), and the durable merge
+      record is the append-only `AuditLog` row (`chat.account_linked`). The
+      `mergedIntoUserId` relation is `onDelete: SetNull` on purpose — deleting the
+      *surviving* account must never erase the tombstone. **Confirm this retention
+      story with whoever owns the Nigerian data-protection posture** (NDPA 2023):
+      a deactivated row holding a phone number and role flags is still personal
+      data, and the merge is arguably a change of purpose that the privacy notice
+      should cover.
+- [ ] **An admin `COMPLETE` on a `SELLER_PROFILE_CONFLICT` deletes the absorbed
+      account's `SellerProfile`** — one account cannot hold two payout
+      destinations, and leaving a live `providerRecipientCode` on a deactivated
+      account is a rule 4 hazard. The transfers it already made survive in the
+      `Payout` rows, but the destination itself is gone. That is a deliberate,
+      audited admin decision, not a silent one — confirm the operations runbook
+      says so.
+
+- [x] **Platform analytics is `@Roles('ADMIN')` and read-only.** `GET
+      /admin/analytics/platforms` exposes aggregate counts and money across all
+      platforms, so it inherits the class-level ADMIN gate on `AdminController`. It
+      writes **no** audit row: rule 6 covers every state **transition** and every
+      admin **action**, and this is a read that changes nothing — auditing reads
+      would bury the transitions that matter in a table of page loads. Revisit if a
+      compliance requirement ever asks for read-audit on admin reporting.
+- [x] **`Transaction.origin` is server-owned (rule 1).** It is not a field on any
+      create DTO, so with the global `ValidationPipe({ forbidNonWhitelisted: true })`
+      a client that sends `origin` gets a **400** rather than a silently-stripped
+      field — the value never reaches the service. Each entrypoint passes a literal
+      (`WEB` from the web controller and invoices, `EAAS` from `/v1`, the seller's
+      platform from the chat dialog), it is never updated, and it intentionally
+      survives an account merge: it records where a transaction happened, not who
+      ended up owning it.
+- [ ] **`ANALYTICS_MAX_RANGE_DAYS`** (default **366**) bounds the width of an
+      analytics window, which in turn bounds the scan: the query stages a cohort of
+      transactions and probes each one's timeline, so an unbounded window is a scan
+      whose cost the caller chooses. Defaulted, not secret — no Render action needed
+      unless you want a tighter cap than a year.
 
 ## 3. Observability & ops
 
@@ -154,6 +209,16 @@ npm run db:up && npm run db:migrate:test && npm run test:e2e
       using `DIRECT_URL`, with runtime on pooled `DATABASE_URL` (don't swap them).
       Still unproven against Supabase + pgbouncer.
 - [ ] Seed (`prisma/seed.ts`) is dev-only — ensure it never runs against prod.
+- [ ] **Three migrations are UNAPPLIED and have never run anywhere** —
+      `20260801000000_notification_read_at`, `20260911000000_chat_account_linking`
+      and `20260912000000_platform_analytics`. All three were authored **offline**
+      (`prisma migrate diff --from-schema-datamodel <base> --to-schema-datamodel
+      prisma/schema.prisma`) because the docker daemon was down, and each was
+      inspected for destructive DDL before commit (the analytics one is pure
+      `CREATE TYPE` / `ADD COLUMN` / `CREATE INDEX`). **Apply them against a real
+      Postgres before trusting them** — `npm run db:up && npm run
+      db:migrate:test` locally first. The e2e suites for the last two have also
+      never executed for the same reason.
 - [ ] Backups / PITR confirmed on the Supabase project; document restore steps.
 - [ ] Index review for hot queries (status scans, `releaseAfter` cron scan,
       idempotency-key lookups).

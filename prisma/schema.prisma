@@ -73,6 +73,20 @@ enum TransactionStatus {
   EXPIRED // link/window lapsed with no payment
 }
 
+/// Where a transaction was created. Server-owned, written once by the creating
+/// entrypoint, never client-supplied and never updated — the same posture as
+/// TransactionStatus (rule 1). `X` exists for symmetry with ChatPlatform even
+/// though the X adapter is a stub; adding it now avoids a later migration.
+enum TransactionOrigin {
+  WEB
+  TELEGRAM
+  WHATSAPP
+  INSTAGRAM
+  MESSENGER
+  X
+  EAAS
+}
+
 /// How a transaction becomes eligible for automated release.
 enum ReleaseRule {
   BUYER_CONFIRMATION // buyer must confirm (OTP or in-app)
@@ -175,6 +189,23 @@ enum ChatPlatform {
   X
 }
 
+/// Lifecycle of one chat↔web account-link attempt.
+enum ChatLinkRequestStatus {
+  PENDING // minted, not yet attempted in chat
+  COMPLETED // merge ran
+  PENDING_REVIEW // hard collision — needs an admin
+  REJECTED // an admin declined it
+  EXPIRED // TTL passed unused
+  CANCELLED // superseded by a newer request from the same user
+}
+
+/// Persisted conflicts only. The in-flight-payout case is transient and never
+/// reaches this enum — it refuses without writing anything (see ChatLinkService).
+enum ChatLinkConflictReason {
+  SELLER_PROFILE_CONFLICT // both users own a SellerProfile
+  SELF_TRANSACTION_CONFLICT // merge would make one user both buyer and seller
+}
+
 enum NotificationStatus {
   PENDING
   SENT
@@ -237,6 +268,15 @@ model User {
   /// Meduman user (website/chat), never client-writable.
   merchantId String?    @db.Uuid
   merchant   Merchant?  @relation(fields: [merchantId], references: [id])
+
+  /// Set on an absorbed chat-born account. The row is a TOMBSTONE: never hard
+  /// deleted, so the historical record survives (legal retention). SetNull rather
+  /// than Cascade so deleting the surviving account cannot erase the tombstone;
+  /// the durable merge record lives in the append-only AuditLog.
+  mergedIntoUserId String?   @db.Uuid
+  mergedInto       User?     @relation("AccountMerges", fields: [mergedIntoUserId], references: [id], onDelete: SetNull)
+  mergedAt         DateTime?
+
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 
@@ -249,6 +289,8 @@ model User {
   chatIdentities       ChatIdentity[]
   invoicesAsSeller     Invoice[]      @relation("SellerInvoices")
   invoicesAsBuyer      Invoice[]      @relation("BuyerInvoices")
+  mergedFrom           User[]            @relation("AccountMerges")
+  targetedLinkRequests ChatLinkRequest[] @relation("TargetedLinkRequests")
 
   @@index([status])
   @@index([createdAt])
@@ -364,6 +406,10 @@ model Transaction {
   merchantId String?   @db.Uuid
   merchant   Merchant? @relation(fields: [merchantId], references: [id])
 
+  /// Where this transaction was created. Server-owned; written once at creation
+  /// from a literal by the entrypoint, never from a request body, never updated.
+  origin TransactionOrigin @default(WEB)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -382,6 +428,7 @@ model Transaction {
   @@index([createdAt])
   @@index([expiresAt])
   @@index([merchantId])
+  @@index([origin, createdAt])
   @@map("transactions")
 }
 
@@ -666,6 +713,9 @@ model TimelineEvent {
 
   @@index([transactionId])
   @@index([createdAt])
+  /// Serves the per-stage EXISTS probe in the analytics funnel — without it each
+  /// probe is a scan of the transaction's events.
+  @@index([transactionId, newState])
   @@map("timeline_events")
 }
 
@@ -752,11 +802,52 @@ model ChatIdentity {
 
   session ChatSession?
 
+  /// Link requests that were consumed for this identity (history).
+  linkRequests ChatLinkRequest[]
+
   /// One Meduman identity per platform account — the uniqueness that makes first
   /// contact idempotent (never a second auth user for the same chat account).
   @@unique([platform, platformUserId])
   @@index([userId])
   @@map("chat_identities")
+}
+
+/// One chat↔web account-link attempt. The code is stored only as a keyed
+/// HMAC-SHA256 — the plaintext is returned once to the authenticated web caller
+/// and never persisted, logged or audited.
+model ChatLinkRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  codeHash String @unique
+
+  /// The web account that minted the code — the merge TARGET.
+  targetUserId String @db.Uuid
+  targetUser   User   @relation("TargetedLinkRequests", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  /// Filled at consumption, when the chat account is known.
+  platform       ChatPlatform?
+  platformUserId String?
+  chatIdentityId String?       @db.Uuid
+  chatIdentity   ChatIdentity? @relation(fields: [chatIdentityId], references: [id], onDelete: SetNull)
+  /// The absorbed chat-born account.
+  sourceUserId String? @db.Uuid
+
+  status         ChatLinkRequestStatus  @default(PENDING)
+  conflictReason ChatLinkConflictReason?
+
+  attemptCount Int       @default(0)
+  expiresAt    DateTime
+  consumedAt   DateTime?
+  resolvedAt   DateTime?
+  /// Admin id that resolved it. Not FK'd — actors span identity spaces.
+  resolvedBy   String?   @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([targetUserId, status])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("chat_link_requests")
 }
 
 /// Conversational state for one chat identity. This is NOT transaction state —

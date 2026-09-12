@@ -23,6 +23,7 @@ import { StorageModule } from './modules/storage/storage.module';
 import { EvidenceModule } from './modules/evidence/evidence.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { WaitlistModule } from './modules/waitlist/waitlist.module';
 import { QueueModule } from './modules/queue/queue.module';
 import { ChatModule } from './modules/chat/chat.module';
@@ -61,6 +62,7 @@ import { OutboundEventsModule } from './modules/outbound-events/outbound-events.
     StorageModule,
     EvidenceModule,
     AuditModule,
+    AnalyticsModule,
     AdminModule,
     WaitlistModule,
     ChatModule,

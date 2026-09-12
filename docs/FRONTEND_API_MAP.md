@@ -174,6 +174,8 @@ is in-app. Both call `apply(BUYER_CONFIRM)` server-side then enqueue release.
 | `/admin/transactions/:id` | Tx + timeline + audit log + evidence | ✅ `GET /transactions/:id` (admin allowed) + 🟥 `GET /transactions/:id/audit` (Part B §7) |
 | `/admin/disputes` | Dispute queue | 🟥 `GET /admin/disputes` |
 | `/admin/disputes/:id` | Resolve for seller (release) / buyer (refund) | ✅ `POST /disputes/:id/resolve` |
+| `/admin/link-requests` | Parked chat↔web merges needing a ruling | ✅ `GET /admin/chat/link-requests` + `POST …/:id/resolve` (Part B §11) |
+| `/admin/analytics` | Per-platform funnel + money table, date-range picker | ✅ `GET /admin/analytics/platforms` (Part B §12) |
 
 ---
 
@@ -639,6 +641,117 @@ document / PDF** — this backend serves the structured JSON + owns the number.
 
 Phase 2 (direct/non-escrow toggle) and Phase 3 (recurring/batch) are separate,
 not yet built.
+
+---
+
+## §11 — Chat account linking 🔒 / admin 🔒
+
+Built and wired. A user who first met Meduman inside a chat (WhatsApp/Telegram/…)
+has a throwaway account minted by the bot. Linking moves everything they own onto
+the real web account they sign into here, so chat orders appear in their
+dashboard.
+
+Web routes (🔒, the caller can only ever act on their own account):
+
+- `POST /chat/link-code` → `{ code, expiresAt }`. Mints one short-lived
+  single-use code. **The plaintext is returned exactly once** — it is stored only
+  as a keyed HMAC, and is never logged, audited or recoverable. Minting supersedes
+  any earlier live code for that user. Throttled to 5/min. Show it with the
+  instruction *"send `/connect <code>` to the Meduman bot"* and a countdown to
+  `expiresAt`.
+- `GET /chat/link-status` → `{ linked, pendingCode, underReview }`. Non-secret
+  state for the "connect" card: whether any chat account is already linked,
+  whether a code is live, and whether a request is parked for review.
+
+Admin routes (`@Roles('ADMIN')`, rule 6 — every action is audited):
+
+- `GET /admin/chat/link-requests?status=&cursor=&limit=` → the review queue,
+  newest first, defaulting to `PENDING_REVIEW`. **Never returns `codeHash`.**
+- `POST /admin/chat/link-requests/:id/resolve` — body
+  `{ outcome: 'COMPLETE' | 'REJECT', keepProfile?: 'TARGET' | 'SOURCE' }`.
+  `REJECT` closes it having written nothing else. `COMPLETE` needs an explicit
+  `keepProfile` and **409s on a `SELF_TRANSACTION_CONFLICT`** — no profile choice
+  makes one user a valid counterparty to themselves, so reject is the only way out.
+  A request that is not `PENDING_REVIEW` is a 409; an unknown id is a 404.
+
+The user-facing outcome is deliberately vague: a wrong, expired, consumed or
+attempt-capped code all produce the same "that code didn't work" reply, so the
+chat is not an oracle for guessing codes.
+
+---
+
+## §12 — `GET /admin/analytics/platforms` 🔒 (`@Roles('ADMIN')`)
+
+Built and wired. The "which platform does what" table: a per-`origin` funnel and
+money view over a date range, for the `/admin/analytics` page. Read-only.
+
+**Query:** `from` and `to`, both **required**, both ISO-8601
+(`@IsISO8601`). The window is a **half-open interval** — `createdAt >= from AND
+createdAt < to` — so `to` is **exclusive**; a transaction created exactly at `to`
+is not in the window. `from >= to` is a 400, and a range wider than
+`ANALYTICS_MAX_RANGE_DAYS` (default 366) is a 400. A missing bound is a 400, never
+a silent default.
+
+**Response:**
+
+```jsonc
+{
+  "from": "2026-09-01T00:00:00.000Z",   // echo of the window, resolved
+  "to":   "2026-10-01T00:00:00.000Z",
+  "platforms": [ /* always exactly 7 rows, one per origin, plus see below */ ],
+  "totals": { "origin": "ALL", /* …same fields… */ }
+}
+```
+
+Each row — and `totals` — carries:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `origin` | `'WEB' \| 'TELEGRAM' \| 'WHATSAPP' \| 'INSTAGRAM' \| 'MESSENGER' \| 'X' \| 'EAAS'` | `totals.origin` is `'ALL'` |
+| `sellers` / `buyers` | number | distinct counterparties in the cohort |
+| `created` | number | cohort size |
+| `published` | number | ever reached `LINK_ACTIVE` |
+| `paymentStarted` | number | ever reached `PAYMENT_PENDING` |
+| `protected` | number | ever reached `PAYMENT_PROTECTED` |
+| `delivered` | number | ever reached `CONFIRMATION_PENDING` |
+| `released` | number | ever reached `RELEASED` |
+| `disputed` | number | ever had a dispute raised |
+| `disputeRate` | number | **a fraction, not a percent** — `0.021` means 2.10%. `0` when nothing was protected |
+| `protectedVolumeKobo` | **string** | decimal string of integer kobo |
+| `releasedVolumeKobo` | **string** | decimal string of integer kobo |
+| `feesKobo` | **string** | decimal string of integer kobo |
+
+**Render, don't recompute.** `platforms` is **always seven rows** — one per
+origin, zero-filled — so an empty platform is a real `0` row rather than a missing
+one; never index it positionally, match on `origin`. Money arrives as **decimal
+strings** (a JSON number cannot hold the kobo range Postgres `SUM` returns), so
+parse with your decimal helper — not `Number()` — before formatting ₦. `totals` is
+the sum of the per-origin rows, so don't add them up client-side.
+
+**Print the cohort caveat next to a short-window view.** Rows are cohorts by
+creation date, and a transaction counts in every stage it has **ever** reached,
+not only its current one. That means a short **recent** window looks worse than
+the platform is: a transaction created yesterday cannot have been delivered and
+released yet, so the late-funnel stages read near zero. Compare like-for-like
+windows, or use a long one, before drawing a conclusion — and say so in the UI.
+
+**Do not assume the columns narrow all the way down.** `created >= published >=
+paymentStarted >= protected` **is** an invariant and is safe to assert. `delivered
+>= released` is **not**: after protection the lifecycle forks, and a dispute
+resolved for the seller goes `DISPUTED → RELEASE_PROCESSING → COMPLETED` without
+ever passing through `CONFIRMATION_PENDING`. A cohort containing such a dispute
+has `released > delivered`. That is a fact about the business, not a bug — both
+columns are exactly "did a timeline row with that state ever exist" — so render
+the rows honestly rather than clamping `released` to `delivered`, and don't wire
+a chart that assumes a clean funnel below `protected`.
+
+It holds even though individual transactions move **backwards** through the
+lifecycle — an abandoned payment drops `PAYMENT_PENDING → LINK_ACTIVE`, a
+withdrawn dispute drops `DISPUTED → PAYMENT_PROTECTED` — because the counts read
+the immutable timeline rather than the current status, which is exactly why the
+funnel is trustworthy.
+
+---
 
 # Part C — Backend gaps summary (build order)
 

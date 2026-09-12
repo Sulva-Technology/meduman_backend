@@ -478,19 +478,145 @@ Migrations use `DIRECT_URL`. Runtime uses `DATABASE_URL`. Don't swap them.
   at send) + blocking 0.0.0.0 / IPv4-mapped IPv6 are follow-ups before external
   merchants point live URLs at us.
 
+- **chat/ account linking — done (code); e2e authored but NOT executed.** Links a
+  chat-born throwaway account to the real web account it belongs to. Design:
+  [`docs/superpowers/specs/2026-09-11-chat-web-account-linking-design.md`](docs/superpowers/specs/2026-09-11-chat-web-account-linking-design.md).
+  An authenticated web user mints a short-lived single-use code
+  (`POST /chat/link-code`); they type it into the bot as `/connect <code>`. The
+  code is stored ONLY as a keyed HMAC-SHA256 (`ChatLinkRequest.codeHash`, keyed by
+  `CHAT_LINK_HASH_SECRET`) — the plaintext is returned once, never logged or
+  audited. Verification is **generic to the client** (no oracle): a wrong, expired,
+  consumed or attempt-capped code all return the same `INVALID`, exactly as the OTP
+  path does; the precise reason goes to the log and audit trail only.
+  `AccountMergeService.merge` absorbs the chat account into the web account in ONE
+  `$transaction` — identities, transactions (bought + sold), payouts, invoices,
+  notifications, disputes and evidence all re-parent; **`TimelineEvent.actorId` and
+  `AuditLog.actorId` are deliberately NOT touched** (immutable history, rule 6),
+  which is why the absorbed account is **TOMBSTONED, never hard-deleted**
+  (`User.status = DEACTIVATED` + `mergedIntoUserId` + `mergedAt`; the relation is
+  `SetNull` so deleting the survivor cannot erase the tombstone) — legal retention.
+  Two hard collisions refuse and park the request as `PENDING_REVIEW` for an admin:
+  `SELLER_PROFILE_CONFLICT` (two payout destinations) and
+  `SELF_TRANSACTION_CONFLICT` (merge would make one user both buyer and seller of
+  the same escrow). An in-flight payout (`PENDING`/`PROCESSING`) is NOT a collision
+  — it refuses **transiently, leaving the code unconsumed**, because the transfer
+  destination is read from the seller profile at send time (rule 4). Admin surface
+  (`@Roles('ADMIN')`): `GET /admin/chat/link-requests` (defaults to
+  `PENDING_REVIEW`; never returns `codeHash`) and
+  `POST /admin/chat/link-requests/:id/resolve` — `REJECT` closes it having written
+  nothing else; `COMPLETE` requires an explicit `keepProfile: 'TARGET'|'SOURCE'`
+  and **409s on `SELF_TRANSACTION_CONFLICT`**, which no profile choice can fix. The
+  admin's ruling is the only thing that admits a `SELLER_PROFILE_CONFLICT`
+  (`merge`'s `overrideCollision`, narrowed to that one kind); the surviving account
+  keeps its own payout destination and the absorbed account's `SellerProfile` is
+  deleted, since one account cannot hold two. Every mint, rejection, completion and
+  the merge itself writes an audit row (rule 6). Additive migration
+  `20260911000000_chat_account_linking` (**UNAPPLIED** — authored offline via
+  `migrate diff --from-schema-datamodel`; the docker daemon is down). Tests: link
+  crypto, mint/consume/replay/expiry/attempt-cap, every collision and race path,
+  the merge re-parenting contract + tombstone, `/connect` dialog, both controllers
+  (52 linking tests) + [`test/chat-account-linking.e2e-spec.ts`](test/chat-account-linking.e2e-spec.ts)
+  (8 money-safety cases — **authored, never run**, no e2e has executed here).
+
+- **analytics/ (platform metrics) — done (code); e2e authored but NOT executed.**
+  Answers "which platform actually does what" — a per-`origin` funnel + money
+  table over a date range (`GET /admin/analytics/platforms`, `@Roles('ADMIN')`).
+  Design: [`docs/superpowers/specs/2026-09-11-platform-analytics-design.md`](docs/superpowers/specs/2026-09-11-platform-analytics-design.md).
+  **`Transaction.origin`** (`TransactionOrigin` enum — `WEB` / `TELEGRAM` /
+  `WHATSAPP` / `INSTAGRAM` / `MESSENGER` / `X` / `EAAS`) is **server-owned**: never
+  a DTO field, never read from a request body, never updated. Each entrypoint
+  passes a literal — `transactions.controller.ts` and `invoices.service.ts` pass
+  `WEB`, `v1-transactions.controller.ts` passes `EAAS`, and `chat-dialog.service.ts`
+  passes `toTransactionOrigin(identity.platform)` (the **seller's** platform, not
+  the buyer's). It is a record of the past: linking a chat account to a web account
+  re-parents the row's `sellerId` but leaves `origin` alone. Column default `WEB`
+  is a backstop, not the mechanism. `ALL_ORIGINS` (Task 2's mapper) is the single
+  vocabulary the zero-fill and the totals row both derive from, so the response is
+  **always seven rows + `totals`** whatever the data.
+  **The funnel reads `TimelineEvent`, it does NOT rank statuses.** A status-rank
+  funnel is provably wrong on this lifecycle: `PAYMENT_PENDING → LINK_ACTIVE`
+  (`PAYMENT_ABANDONED`), `DISPUTED → PAYMENT_PROTECTED` (`WITHDRAW_DISPUTE`) and
+  `RELEASE_PROCESSING → RELEASE_PROCESSING` (`PAYOUT_RETRY`) all move a
+  transaction's final status *backwards* through the funnel. The
+  **abandoned-payment case is the proof**: a buyer who opens checkout and walks
+  away leaves the transaction at `LINK_ACTIVE`, which a status-rank funnel reads as
+  "never started payment" and loses the attempt entirely. So the service's single
+  `$queryRaw` stages each cohort transaction with an `EXISTS` probe against
+  `timeline_events.new_state` (backed by the new `(transaction_id, new_state)`
+  index) and counts `FILTER (WHERE …)` per stage. The invariant that makes this
+  sound — every transition the machine permits writes exactly one timeline row, and
+  every rejection writes none — has its own test,
+  `src/modules/transactions/timeline-parity.spec.ts`.
+  **Cohort semantics, and the caveat the frontend must print:** rows are cohorts by
+  `createdAt` in `[from, to)`. A transaction counts in every stage it has *ever*
+  reached, not only its current one. A short recent window therefore looks **worse**
+  than the platform is — a transaction created yesterday cannot have been delivered
+  and released yet, so late-funnel stages read near zero. Compare like-for-like
+  windows (or long ones) before drawing a conclusion.
+  **Money leaves the service as decimal strings, never `BigInt`.** Postgres `SUM`
+  returns `bigint`; Prisma's `$queryRaw` yields a JS `BigInt`, and
+  `JSON.stringify` **throws** `TypeError: Do not know how to serialize a BigInt`.
+  `analytics.mapper.ts` converts every kobo value to a string at the boundary,
+  `COALESCE`s a zero-row `SUM` to `0`, and re-derives `totals.disputeRate` from the
+  summed counts rather than averaging per-origin rates (averaging would weight one
+  protected transaction the same as ten thousand). `disputeRate` is a **fraction**,
+  not a percentage. Window width is capped by `ANALYTICS_MAX_RANGE_DAYS`; ordering
+  and width are cross-field checks in the controller. Read-only, so it writes **no
+  audit row** (rule 6 covers state changes and admin *actions*, not reads). Additive
+  migration `20260912000000_platform_analytics` (**UNAPPLIED** — authored offline
+  via `migrate diff --from-schema-datamodel`: pure `CREATE TYPE` / `ADD COLUMN` /
+  `CREATE INDEX`, 0 `DROP`, 0 `ALTER COLUMN`). Tests: origin mapper, analytics
+  mapper (incl. a `JSON.stringify` of a `bigint` above 2^53), service mapping +
+  window passthrough, the timeline-parity matrix (216 pairs), the funnel-shape
+  spec, the DTO, the controller's range checks, and
+  [`test/platform-analytics.e2e-spec.ts`](test/platform-analytics.e2e-spec.ts) (8
+  cases — **authored, never run**; includes the abandoned-payment and
+  withdrawn-dispute cases that prove the timeline-reading design, a case asserting
+  `origin` survives a chat→web account link untouched, and the
+  dispute-resolved-for-seller case below).
+  **The stage counts are cumulative only up to `protected`.** `created >=
+  published >= paymentStarted >= protected` is an invariant; **`delivered >=
+  released` is NOT** — after protection the lifecycle forks, and a dispute resolved
+  for the seller reaches `COMPLETED` via `DISPUTED → RELEASE_PROCESSING` without
+  ever entering `CONFIRMATION_PENDING`, so a cohort can genuinely have more
+  released than delivered transactions. Both columns remain honest (each is
+  exactly "a timeline row with this `newState` exists") — the columns were never
+  wrong, the invariant drawn from them was.
+  `src/modules/analytics/funnel-shape.spec.ts` derives that fork from
+  `transition()` itself so it cannot rot back; **do not "fix" the query to make
+  the columns monotone**, because clamping `released` would be the lie. This was
+  the CRITICAL defect the final review caught, and the spec and plan were corrected
+  alongside the code.
+
 **Status: full spine + chat bot gateway (Telegram + Meta adapters, X stub, DVA
 payments, chat photo/document evidence) + Phase 1 invoicing + EaaS Slice 1
 (merchant tenancy + API-key `/v1`) done and PROVEN
 against a real Postgres +
-Redis — 49 unit suites / 381 tests + 28 e2e (5 suites), lint + build clean.** All eight migrations apply clean to
-an empty DB; the app boots, `/health` and `/health/ready`
-(`{"db":true,"redis":true}`) return 200, and an unauthenticated protected route
-still 401s. (`ioredis` pinned to `5.10.1` to match bullmq's exact pin.) New env
-since scaffold: `OTP_HASH_SECRET`, `OTP_MAX_ATTEMPTS`, `WEBHOOK_MAX_AGE_SECONDS`,
-`SENTRY_DSN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
-`CHAT_IDENTITY_EMAIL_DOMAIN`, `CHAT_SESSION_TTL_SECONDS`, the `META_*` /
-`WHATSAPP_*` / `MESSENGER_*` / `INSTAGRAM_*` set, `X_ADAPTER_ENABLED`, and
-`EAAS_API_KEY_SECRET`.
+Redis — 70 unit suites / 514 tests, lint + build clean. Chat account linking and
+platform analytics are each **unit-proven only**: their migrations
+`20260911000000_chat_account_linking` and `20260912000000_platform_analytics` are
+**UNAPPLIED** and their e2e suites have **never executed** (the docker daemon was
+down throughout). Eleven migrations exist; the newest three —
+`20260801000000_notification_read_at`, `20260911000000_chat_account_linking` and
+`20260912000000_platform_analytics` — were all authored offline and are
+**UNAPPLIED**. Once they are applied, the app boots, `/health` and
+`/health/ready` (`{"db":true,"redis":true}`) return 200, and an unauthenticated
+protected route still 401s. (`ioredis` pinned to `5.10.1` to match bullmq's exact
+pin.) New env since scaffold: `OTP_HASH_SECRET`, `OTP_MAX_ATTEMPTS`,
+`WEBHOOK_MAX_AGE_SECONDS`, `SENTRY_DSN`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_WEBHOOK_SECRET`, `CHAT_IDENTITY_EMAIL_DOMAIN`,
+`CHAT_SESSION_TTL_SECONDS`, the `META_*` / `WHATSAPP_*` / `MESSENGER_*` /
+`INSTAGRAM_*` set, `X_ADAPTER_ENABLED`, `EAAS_API_KEY_SECRET`,
+`CHAT_LINK_HASH_SECRET` (+ `CHAT_LINK_CODE_LENGTH`, `CHAT_LINK_CODE_TTL_SECONDS`,
+`CHAT_LINK_MAX_ATTEMPTS`), and `ANALYTICS_MAX_RANGE_DAYS` (366).
+
+**Known-red on `npm test` (pre-existing, NOT from account linking):** 4 tests in
+`src/modules/queue/queue.service.spec.ts` (3) and
+`src/modules/notifications/notifications.service.spec.ts` (1) assert a BullMQ
+`jobId` containing a colon (`release:tx-1`) while the committed service builds a
+dot (`release.tx-1` — BullMQ rejects `:` in a custom job id). The specs are
+unmodified in the tree, so the mismatch is committed. Fixing it means editing job
+ids on the release path, which is money-path idempotency machinery.
 
 **Gotcha worth remembering:** global guards must be registered as
 `{ provide: APP_GUARD, useExisting: SupabaseJwtGuard }` with the class also in

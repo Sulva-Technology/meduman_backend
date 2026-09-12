@@ -10,6 +10,7 @@ import {
   type User,
 } from '@prisma/client';
 import { PrismaService } from '@/prisma/prisma.service';
+import { toTransactionOrigin } from '@/modules/analytics/origin.mapper';
 import { TransactionsService } from '@/modules/transactions/transactions.service';
 import { TransitionRejectedError } from '@/modules/transactions/transition-rejected.error';
 import { PaymentsService } from '@/modules/payments/payments.service';
@@ -25,6 +26,7 @@ import type {
   OutboundChatMessage,
 } from '../adapters/chat-adapter';
 import { ChatEvidenceService, UnsupportedMediaError } from '../evidence/chat-evidence.service';
+import { ChatLinkService } from '../linking/chat-link.service';
 import { ChatStep, type ChatDraft } from './dialog.types';
 
 /** Dispute statuses in which fresh evidence is still worth accepting. */
@@ -44,6 +46,9 @@ const HELP = [
   '  /dispute <reason> — open a dispute on your current transaction',
   '  /status — show your current transaction',
   '  /cancel — abandon the current step',
+  '',
+  'Account:',
+  '  /connect <code> — link this chat to your Meduman account',
 ].join('\n');
 
 /**
@@ -68,6 +73,7 @@ export class ChatDialogService {
     private readonly disputes: DisputesService,
     private readonly queue: QueueService,
     private readonly evidence: ChatEvidenceService,
+    private readonly links: ChatLinkService,
   ) {}
 
   async handle(
@@ -125,6 +131,8 @@ export class ChatDialogService {
         return this.markDelivered(user, session, arg);
       case '/dispute':
         return this.raiseDispute(user, session, arg);
+      case '/connect':
+        return this.connectAccount(identity, arg);
       case '/status':
         return this.showStatus(user, session, arg);
       default:
@@ -211,6 +219,8 @@ export class ChatDialogService {
       sellerId: user.id,
       title: draft.title,
       amount: draft.amountKobo,
+      // The platform the seller typed /sell on, not the buyer's.
+      origin: toTransactionOrigin(identity.platform),
       ...(description ? { description } : {}),
     });
     // Publish immediately so a buyer can pay the link.
@@ -540,6 +550,39 @@ export class ChatDialogService {
       return { text: 'No transaction found for you with that code.' };
     }
     return { text: `"${tx.title}" — ₦${formatNaira(tx.amount)} — status: ${tx.status}.` };
+  }
+
+  /**
+   * Link this chat account to the web account that minted the code. The reply is
+   * deliberately uninformative on failure — the same sentence whether the code
+   * was wrong, expired or already used — so the chat is not an oracle for
+   * guessing codes.
+   */
+  private async connectAccount(identity: ChatIdentity, arg: string): Promise<OutboundChatMessage> {
+    if (!arg) {
+      return {
+        text: 'Send the code from your Meduman account page, e.g. /connect ABCD2345',
+      };
+    }
+
+    const outcome = await this.links.consume(identity, arg);
+
+    switch (outcome.status) {
+      case 'LINKED':
+        return {
+          text: "Linked ✅ This chat is now connected to your Meduman account — you'll see its transactions in your dashboard.",
+        };
+      case 'ALREADY_LINKED':
+        return { text: 'Already linked ✅' };
+      case 'PENDING_REVIEW':
+        return {
+          text: "This chat account has activity we need to review before linking — we'll message you here shortly.",
+        };
+      case 'RETRY':
+        return { text: 'A payout is processing right now — try that code again in a minute.' };
+      case 'INVALID':
+        return { text: "That code isn't valid. Get a fresh one from your Meduman account page." };
+    }
   }
 
   private friendlyError(err: unknown, fallback: string): OutboundChatMessage {

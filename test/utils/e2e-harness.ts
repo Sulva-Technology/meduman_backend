@@ -71,6 +71,7 @@ const TABLES = [
   'audit_logs',
   'webhook_events',
   'chat_sessions',
+  'chat_link_requests',
   'chat_identities',
   'chat_inbound_events',
   'seller_profiles',

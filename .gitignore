@@ -27,3 +27,6 @@ logs
 *.swp
 .vscode/*
 !.vscode/extensions.json
+
+# SDD scratch workspace (ledgers, briefs, review packages — never part of the code)
+/.superpowers/

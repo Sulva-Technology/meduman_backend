@@ -32,8 +32,7 @@ export class PaymentReconcileService {
     private readonly payments: PaymentsService,
     config: ConfigService<Env, true>,
   ) {
-    this.thresholdMs =
-      config.get('PAYMENT_RECONCILE_AFTER_SECONDS', { infer: true }) * 1000;
+    this.thresholdMs = config.get('PAYMENT_RECONCILE_AFTER_SECONDS', { infer: true }) * 1000;
   }
 
   /** Re-verify recent stranded charges. Returns how many reached SUCCESS. */
