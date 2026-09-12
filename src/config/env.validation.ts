@@ -81,6 +81,10 @@ export const envSchema = z.object({
   // enough that a slow checkout is not re-verified mid-flight.
   PAYMENT_RECONCILE_AFTER_SECONDS: z.coerce.number().int().positive().default(900),
 
+  // Upper bound on an analytics window, in days. Bounds the scan of a
+  // read-only reporting endpoint.
+  ANALYTICS_MAX_RANGE_DAYS: z.coerce.number().int().positive().default(366),
+
   // Observability — Sentry error tracking. Optional: absent = disabled (no-op).
   SENTRY_DSN: z.string().url().optional(),
 

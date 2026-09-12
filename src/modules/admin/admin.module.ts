@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AnalyticsModule } from '@/modules/analytics/analytics.module';
 import { PayoutsModule } from '@/modules/payouts/payouts.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
@@ -7,7 +8,7 @@ import { AdminService } from './admin.service';
  * Dispute resolution (the other money-moving admin action) stays in the disputes
  * module. */
 @Module({
-  imports: [PayoutsModule],
+  imports: [PayoutsModule, AnalyticsModule],
   controllers: [AdminController],
   providers: [AdminService],
 })
